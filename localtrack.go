@@ -651,6 +651,8 @@ func (s *LocalTrack) writeWorker(provider SampleProvider, onComplete func()) {
 // duplicated from pion mediaengine.go
 func payloaderForCodec(codec webrtc.RTPCodecCapability) (rtp.Payloader, error) {
 	switch strings.ToLower(codec.MimeType) {
+	case strings.ToLower(webrtc.MimeTypeAV1):
+		return &codecs.AV1Payloader{}, nil
 	case strings.ToLower(webrtc.MimeTypeH264):
 		return &codecs.H264Payloader{}, nil
 	case strings.ToLower(webrtc.MimeTypeH265):
