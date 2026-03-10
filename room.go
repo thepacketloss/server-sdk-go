@@ -15,10 +15,12 @@
 package lksdk
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,16 +28,17 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
-	"golang.org/x/exp/maps"
 	"golang.org/x/mod/semver"
 	"google.golang.org/protobuf/proto"
 
 	protoLogger "github.com/livekit/protocol/logger"
 	protosignalling "github.com/livekit/protocol/signalling"
+
 	"github.com/livekit/server-sdk-go/v2/signalling"
 
 	"github.com/livekit/mediatransportutil/pkg/pacer"
 	"github.com/livekit/protocol/auth"
+	protoCodecs "github.com/livekit/protocol/codecs"
 	"github.com/livekit/protocol/livekit"
 )
 
@@ -131,6 +134,14 @@ func WithInterceptors(interceptors []interceptor.Factory) ConnectOption {
 	}
 }
 
+// WithIncludeDefaultInterceptors sets whether to register default interceptors
+// along with custom interceptors.
+func WithIncludeDefaultInterceptors(include bool) ConnectOption {
+	return func(p *signalling.ConnectParams) {
+		p.IncludeDefaultInterceptors = include
+	}
+}
+
 // WithICETransportPolicy sets the ICE transport policy (UDP, Relay, etc.).
 func WithICETransportPolicy(iceTransportPolicy webrtc.ICETransportPolicy) ConnectOption {
 	return func(p *signalling.ConnectParams) {
@@ -168,10 +179,13 @@ func WithExtraAttributes(attrs map[string]string) ConnectOption {
 	}
 }
 
-// for internal use to test codecs
-func withCodecs(codecs []webrtc.RTPCodecParameters) ConnectOption {
+func WithCodecs(codecs []livekit.Codec) ConnectOption {
 	return func(p *signalling.ConnectParams) {
-		p.Codecs = codecs
+		pCodecs := make([]webrtc.RTPCodecParameters, 0, len(codecs))
+		for i := range codecs {
+			pCodecs = append(pCodecs, protoCodecs.ToWebrtcCodecParameters(&codecs[i]))
+		}
+		p.Codecs = pCodecs
 	}
 }
 
@@ -638,10 +652,25 @@ func (r *Room) cleanup() {
 	r.engine.Close()
 	r.LocalParticipant.closeTracks()
 	r.setSid("", true)
+
 	r.byteStreamHandlers.Clear()
+	r.byteStreamReaders.Range(func(key, value any) bool {
+		if reader, ok := value.(*ByteStreamReader); ok {
+			reader.close()
+		}
+		return true
+	})
 	r.byteStreamReaders.Clear()
+
 	r.textStreamHandlers.Clear()
+	r.textStreamReaders.Range(func(key, value any) bool {
+		if reader, ok := value.(*TextStreamReader); ok {
+			reader.close()
+		}
+		return true
+	})
 	r.textStreamReaders.Clear()
+
 	r.rpcHandlers.Clear()
 	r.LocalParticipant.cleanup()
 }
@@ -951,9 +980,8 @@ func (r *Room) OnSpeakersChanged(speakerUpdates []*livekit.SpeakerInfo) {
 		}
 	}
 
-	activeSpeakers := maps.Values(speakerMap)
-	sort.Slice(activeSpeakers, func(i, j int) bool {
-		return activeSpeakers[i].AudioLevel() > activeSpeakers[j].AudioLevel()
+	activeSpeakers := slices.SortedFunc(maps.Values(speakerMap), func(p1, p2 Participant) int {
+		return cmp.Compare(p2.AudioLevel(), p1.AudioLevel())
 	})
 	r.lock.Lock()
 	r.activeSpeakers = activeSpeakers
