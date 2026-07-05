@@ -1,0 +1,571 @@
+// Copyright 2026 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package synchronizer
+
+import (
+	"io"
+	"sync"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+
+	"github.com/livekit/media-sdk/jitter"
+
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils/rtputil"
+)
+
+const (
+	// transitionSlewRatePerSecond is the rate at which the wall-clock→NTP
+	// transition correction is absorbed: 5ms per second of real time.
+	transitionSlewRatePerSecond = 5 * time.Millisecond
+
+	// wallClockSanityThreshold is the maximum divergence between RTP-derived PTS
+	// and wall-clock PTS before falling back to wall clock in wallClockPTS().
+	wallClockSanityThreshold = 5 * time.Second
+
+	// ntpTrustThreshold is the maximum allowed divergence between NTP-derived PTS
+	// and wall-clock PTS. If NTP disagrees with wall clock by more than this,
+	// the NTP data is suspect (bad SRs, clock jumps, nonsensical timing) and
+	// we clamp to wall clock. This prevents bad publishers from dragging PTS far
+	// from reality.
+	ntpTrustThreshold = 500 * time.Millisecond
+
+	// maxTimelyPacketAge is how long a track can be behind the pipeline deadline
+	// before its PTS is force-corrected forward.
+	maxTimelyPacketAge = 10 * time.Second
+
+	// slewRatePerSecond is the maximum rate at which PTS corrections are absorbed.
+	slewRatePerSecond = 5 * time.Millisecond
+
+	// deadbandThreshold is the minimum |correction| before slew smoothing kicks in.
+	deadbandThreshold = 5 * time.Millisecond
+)
+
+// syncEngineTrack implements TrackSync for a single track within a SyncEngine.
+type syncEngineTrack struct {
+	engine        *SyncEngine
+	track         TrackRemote
+	participantID string
+	logger        logger.Logger
+	converter     *rtputil.RTPConverter
+	startGate     startGate // from start_gate.go, nil if not enabled
+
+	mu              sync.Mutex
+	startTime       time.Time
+	sessionOffset   time.Duration // offset from session start to this track's start
+	lastTS          uint32
+	lastWallPTS     time.Duration // last pure wall-clock-derived PTS, independent of NTP corrections; used as the baseline for wallClockPTSForRTPLocked
+	lastPTSAdjusted time.Duration // last emitted PTS (post-NTP-correction, post-slew, post-monotonicity)
+	initialized     bool          // initializeLocked has run (startTime/sessionOffset/lastTS are set)
+	hasEmitted      bool          // GetPTS has returned at least one PTS; used to distinguish "no prior emission" from "prior emission was zero-valued"
+	closed          bool
+
+	// NTP transition and smoothing
+	ntpTransitioned bool
+	transitionSlew  time.Duration
+	lastSlewPTS     time.Duration // PTS at which slew was last updated
+	lastNtpPTS      time.Duration // last raw NTP PTS (before corrections), for jump detection
+	hasLastNtpPTS   bool          // lastNtpPTS holds a baseline from the current NTP regression (cleared when NTP becomes unavailable or on RTP discontinuity)
+	ntpCorrection   time.Duration // smoothing correction for SR-induced NTP jumps
+
+	// pipeline time feedback
+	lastTimelyPacket time.Time
+
+	// drain
+	maxPTS    time.Duration
+	maxPTSSet bool
+
+	onSR func(drift time.Duration)
+}
+
+// PrimeForStart implements TrackSync. It buffers packets through the optional
+// start gate and initializes the track on the first valid packet.
+func (st *syncEngineTrack) PrimeForStart(pkt jitter.ExtPacket) ([]jitter.ExtPacket, int, bool) {
+	// onStarted (if any) is invoked after st.mu is released to avoid reentrancy
+	// deadlock; see initializeIfNeeded for the rationale.
+	var onStarted func()
+	defer func() {
+		if onStarted != nil {
+			onStarted()
+		}
+	}()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.closed {
+		// Track was closed (either via Close, removeTrackLocked, or post-End
+		// AddTrack). Skip initialization entirely — initializeLocked would
+		// otherwise spuriously fire onStarted for a track that will only
+		// ever return io.EOF from GetPTS. Signal done with no packets.
+		return nil, 0, true
+	}
+
+	if st.initialized || st.startGate == nil {
+		if !st.initialized {
+			onStarted = st.initializeLocked(pkt)
+		}
+		return []jitter.ExtPacket{pkt}, 0, true
+	}
+
+	ready, dropped, done := st.startGate.Push(pkt)
+	if !done {
+		return nil, dropped, false
+	}
+
+	if len(ready) == 0 {
+		ready = []jitter.ExtPacket{pkt}
+	}
+
+	if !st.initialized {
+		onStarted = st.initializeLocked(ready[0])
+	}
+
+	return ready, dropped, true
+}
+
+// initializeLocked sets the track's start time and registers with the engine.
+// Caller must hold st.mu. Returns a non-nil onStarted callback IFF this call
+// was the first track initialization for the engine; the caller MUST invoke
+// the returned callback only after releasing st.mu.
+func (st *syncEngineTrack) initializeLocked(pkt jitter.ExtPacket) func() {
+	receivedAt := pkt.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
+
+	st.startTime = receivedAt
+	st.lastTS = pkt.Timestamp
+	st.lastTimelyPacket = receivedAt
+	st.initialized = true
+
+	// Initialize the engine's session start time.
+	sessionStart, onStarted := st.engine.initializeIfNeeded(receivedAt)
+	st.sessionOffset = time.Duration(receivedAt.UnixNano() - sessionStart)
+	// Seed lastWallPTS to sessionOffset so wallClockPTSForRTPLocked returns
+	// sessionOffset (not 0) for the first packet's RTP-delta extrapolation.
+	// Without this, late-joining tracks would have lastWallPTS=0 and emit
+	// wallPTS starting at 0 instead of sessionOffset, then the NTP trust
+	// threshold clamp (500ms) would lock pts to the wrong wallPTS for any
+	// sessionOffset between ~20ms and 5s (the sanity-fallback range).
+	st.lastWallPTS = st.sessionOffset
+
+	st.logger.Infow("initialized track",
+		"startTime", st.startTime,
+		"sessionOffset", st.sessionOffset,
+		"rtpTS", pkt.Timestamp,
+	)
+	return onStarted
+}
+
+// GetPTS implements TrackSync. It computes the presentation timestamp for a packet
+// using the NTP-grounded timeline when available, falling back to wall clock otherwise.
+func (st *syncEngineTrack) GetPTS(pkt jitter.ExtPacket) (time.Duration, error) {
+	// onStarted (if any) is invoked after st.mu is released to avoid reentrancy
+	// deadlock; see initializeIfNeeded for the rationale.
+	var onStarted func()
+	defer func() {
+		if onStarted != nil {
+			onStarted()
+		}
+	}()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.closed {
+		return 0, io.EOF
+	}
+
+	if !st.initialized {
+		onStarted = st.initializeLocked(pkt)
+	}
+
+	ts := pkt.Timestamp
+
+	// Same RTP timestamp as last packet: return same PTS (same frame).
+	// hasEmitted distinguishes "we've previously emitted for this lastTS" from
+	// the first-call case where lastTS was just set by initializeLocked.
+	if st.hasEmitted && ts == st.lastTS {
+		return st.lastPTSAdjusted, nil
+	}
+
+	// Drop packets older than threshold.
+	if st.engine.oldPacketThreshold > 0 && !pkt.ReceivedAt.IsZero() {
+		age := time.Since(pkt.ReceivedAt)
+		if age > st.engine.oldPacketThreshold {
+			st.logger.Infow("dropping old packet",
+				"age", age,
+				"threshold", st.engine.oldPacketThreshold,
+				"rtpTS", ts,
+			)
+			return 0, ErrPacketTooOld
+		}
+	}
+
+	// Step 1: Try NTP-grounded PTS from SessionTimeline.
+	rawNtpPTS, ntpErr := st.engine.timeline.GetSessionPTS(st.participantID, st.track.ID(), ts)
+
+	wallPTS := st.wallClockPTS(pkt)
+
+	// Audio tracks with external drift compensation (e.g., tempo controller) skip
+	// NTP PTS corrections — drift is handled by resampling, not PTS adjustment.
+	// NTP regression still runs (via OnSenderReport) for drift measurement.
+	useWallClockOnly := st.engine.audioDriftCompensated && st.track.Kind() == webrtc.RTPCodecTypeAudio
+
+	// Step 2: Detect discontinuities and NTP regression jumps on RAW NTP PTS.
+	// This operates before any corrections to avoid feedback loops.
+	//
+	// Signed delta distinguishes forward gaps from backward (reordered) packets.
+	// Unsigned uint32 subtraction would wrap a one-frame backward delta into
+	// ~24 hours, falsely triggering the discontinuity branch and wiping all
+	// NTP state. The jitter buffer should normally hand us in-order packets,
+	// but defense-in-depth is cheap.
+	signedRTPDelta := int32(ts - st.lastTS)
+	rtpDelta := ts - st.lastTS
+	rtpDeltaDuration := st.converter.ToDuration(rtpDelta)
+
+	// ntpNowReady tracks whether the NTP regression is the source for THIS
+	// packet's PTS. This is the unified gate for jump detection, transition
+	// computation, and lastNtpPTS tracking — and the trigger for clearing
+	// smoothing state when NTP goes away. Anything that invalidates the
+	// regression mid-session (estimator outlier rebuild via the timeline,
+	// ResetTrack from a discontinuity below, useWallClockOnly mode) flows
+	// through this single gate.
+	ntpNowReady := ntpErr == nil && !useWallClockOnly
+
+	// signedRTPDelta > 0 implicitly skips the first call (delta is 0 there because
+	// initializeLocked set lastTS to this packet's ts) and any backward reorders.
+	discontinuity := signedRTPDelta > 0 && rtpDeltaDuration >= 30*time.Second
+	if discontinuity {
+		// Stream restart, SSRC reuse with new RTP offset, or massive gap.
+		// Reset the timeline-side regression. rawNtpPTS we already have was
+		// computed against the pre-reset regression; treat NTP as unavailable
+		// for this packet so we fall back to wallPTS and clear smoothing state
+		// in the unified branch below.
+		st.engine.timeline.ResetTrack(st.participantID, st.track.ID())
+		ntpNowReady = false
+		// NTP smoothing state (lastNtpPTS, transitionSlew, ntpCorrection) is
+		// cleared by the !ntpNowReady branch below. lastSlewPTS does not need
+		// to be cleared: the end-of-iter update overwrites it with the
+		// pre-slew PTS for this packet, providing a valid baseline for the
+		// next iteration's slewPTSDelta.
+		st.logger.Warnw("stream discontinuity detected, resetting NTP state", nil,
+			"rtpDelta", rtpDelta,
+			"rtpDeltaDuration", rtpDeltaDuration,
+		)
+	}
+
+	if !ntpNowReady {
+		// NTP is not the source for this packet — either it was never ready,
+		// the estimator was rebuilt internally (persistent outliers in the
+		// timeline's NtpEstimator), the discontinuity branch above just reset
+		// it, or we're in audio-drift-compensated mode. Forget any in-flight
+		// NTP smoothing state so that a future NTP-ready packet triggers a
+		// fresh transition against whatever regression is current then.
+		//
+		// Without this clear, ntpTransitioned would stay true from the prior
+		// NTP session, the transition correction would never be recomputed
+		// against the new regression, and lastNtpPTS would feed a stale
+		// expectation into the jump-detection branch on the very first
+		// post-rebuild packet — producing a large bogus ntpCorrection.
+		if st.ntpTransitioned || st.hasLastNtpPTS || st.ntpCorrection != 0 || st.transitionSlew != 0 {
+			st.ntpTransitioned = false
+			st.transitionSlew = 0
+			st.ntpCorrection = 0
+			st.hasLastNtpPTS = false
+			st.lastNtpPTS = 0
+		}
+	} else if st.hasLastNtpPTS && signedRTPDelta > 0 {
+		// Steady NTP: detect regression jumps by comparing raw NTP PTS against
+		// the previous packet's raw value extrapolated by RTP delta.
+		expectedRawNtpPTS := st.lastNtpPTS + rtpDeltaDuration
+		jump := rawNtpPTS - expectedRawNtpPTS
+		if jump > deadbandThreshold || jump < -deadbandThreshold {
+			st.ntpCorrection -= jump
+			st.logger.Debugw("NTP regression jump detected",
+				"jump", jump,
+				"ntpCorrection", st.ntpCorrection,
+			)
+		}
+	}
+
+	// Track lastNtpPTS for forward (or first-NTP-packet) updates — using a
+	// backward sample would corrupt the next iteration's expected-jump
+	// baseline. signedRTPDelta >= 0 covers the first call (delta = 0, by way
+	// of initializeLocked setting lastTS to this packet's ts) and forward
+	// packets. hasLastNtpPTS is the canonical "have we recorded a baseline"
+	// flag; lastNtpPTS being zero is also a valid raw NTP value at session
+	// start so we never rely on it as a sentinel.
+	if ntpNowReady && signedRTPDelta >= 0 {
+		st.lastNtpPTS = rawNtpPTS
+		st.hasLastNtpPTS = true
+	}
+
+	// Step 3: Compute final PTS with corrections. ntpNowReady (set above) is
+	// the unified gate — covers ntpErr, useWallClockOnly, AND the discontinuity
+	// reset that just invalidated rawNtpPTS by resetting the regression.
+	var pts time.Duration
+	if !ntpNowReady {
+		pts = wallPTS
+	} else {
+		// Apply NTP jump correction.
+		pts = rawNtpPTS + st.ntpCorrection
+
+		// Clamp corrected PTS to within trust threshold of wall clock.
+		clamped := false
+		diff := pts - wallPTS
+		if diff > ntpTrustThreshold || diff < -ntpTrustThreshold {
+			st.logger.Warnw("NTP PTS exceeds trust threshold, clamping to wall clock", nil,
+				"rawNtpPTS", rawNtpPTS,
+				"ntpCorrection", st.ntpCorrection,
+				"wallPTS", wallPTS,
+				"diff", diff,
+			)
+			pts = wallPTS
+			clamped = true
+		}
+
+		// On first successful NTP PTS that is NOT clamped, compute the
+		// transition correction. If clamped, we leave ntpTransitioned=false
+		// so a future un-clamped packet can establish the transition fresh.
+		// Setting ntpTransitioned=true here on a clamp would compute
+		// transitionSlew = wallPTS - wallPTS = 0 and lock that in — when
+		// rawNtpPTS later converges back within the trust threshold, pts
+		// would jump by up to ntpTrustThreshold with no slew to absorb it.
+		if !clamped && !st.ntpTransitioned {
+			st.transitionSlew = wallPTS - pts
+			st.ntpTransitioned = true
+			st.logger.Infow("NTP transition",
+				"wallPTS", wallPTS,
+				"ntpPTS", rawNtpPTS,
+				"transitionSlew", st.transitionSlew,
+			)
+		}
+	}
+
+	// Capture the pre-slew, pre-force-correction, pre-monotonicity PTS as the
+	// next iteration's slew baseline. This is what tracks "media-time
+	// progression" — using the post-correction emitted PTS instead (the
+	// pre-#911 author's original choice and a regression in #911) freezes the
+	// decay clock whenever a force-correction jump or monotonicity bump shifts
+	// the output away from raw media time: slewPTSDelta collapses to ~1ms
+	// (monotonicity step) per packet, dropping the decay step from the
+	// intended 100µs to ~5µs, and stalling drain for tens of minutes.
+	preSlewPTS := pts
+
+	// Compute PTS delta for slew rate calculations.
+	var slewPTSDelta time.Duration
+	if st.hasEmitted {
+		slewPTSDelta = pts - st.lastSlewPTS
+	}
+
+	// Step 4: Apply transition slew (absorb gradually toward zero).
+	if st.transitionSlew != 0 {
+		pts += st.transitionSlew
+
+		if slewPTSDelta > 0 {
+			maxStep := time.Duration(float64(transitionSlewRatePerSecond) * slewPTSDelta.Seconds())
+			if st.transitionSlew > 0 {
+				st.transitionSlew -= maxStep
+				if st.transitionSlew < 0 {
+					st.transitionSlew = 0
+				}
+			} else {
+				st.transitionSlew += maxStep
+				if st.transitionSlew > 0 {
+					st.transitionSlew = 0
+				}
+			}
+		}
+	}
+
+	// Decay ntpCorrection toward zero via slew.
+	if st.ntpCorrection != 0 {
+		if slewPTSDelta > 0 {
+			maxStep := time.Duration(float64(slewRatePerSecond) * slewPTSDelta.Seconds())
+			if st.ntpCorrection > 0 {
+				st.ntpCorrection -= maxStep
+				if st.ntpCorrection < 0 {
+					st.ntpCorrection = 0
+				}
+			} else {
+				st.ntpCorrection += maxStep
+				if st.ntpCorrection > 0 {
+					st.ntpCorrection = 0
+				}
+			}
+		}
+	}
+
+	// Step 6: Pipeline time feedback — if the track has fallen behind the
+	// pipeline's deadline for too long, force-correct PTS forward.
+	if deadline, ok := st.engine.getMediaDeadline(); ok && st.engine.maxMediaRunningTimeDelay > 0 {
+		limit := deadline - st.engine.maxMediaRunningTimeDelay
+		if pts < limit {
+			if time.Since(st.lastTimelyPacket) > maxTimelyPacketAge {
+				oldPTS := pts
+				pts = deadline - st.engine.maxMediaRunningTimeDelay/2
+				st.logger.Warnw("force-correcting PTS forward, track behind pipeline deadline", nil,
+					"oldPTS", oldPTS,
+					"newPTS", pts,
+					"deadline", deadline,
+					"behindBy", limit-oldPTS,
+				)
+			}
+		} else {
+			st.lastTimelyPacket = time.Now()
+		}
+	}
+
+	// Step 7: Enforce monotonicity. hasEmitted distinguishes "we have a prior
+	// emitted PTS to be greater than" from the first-emission case where
+	// lastPTSAdjusted is zero by default.
+	if st.hasEmitted && pts < st.lastPTSAdjusted+time.Millisecond {
+		pts = st.lastPTSAdjusted + time.Millisecond
+	}
+
+	// Step 8: Enforce drain ceiling.
+	if st.maxPTSSet && pts > st.maxPTS {
+		return 0, io.EOF
+	}
+
+	// Update state. lastWallPTS captures the pre-adjustment wall-clock-derived
+	// PTS for this packet so that wallClockPTSForRTPLocked has an NTP-independent
+	// baseline for the next packet's RTP-delta extrapolation. lastSlewPTS holds
+	// the pre-slew/pre-force-correction PTS (captured as preSlewPTS above) so
+	// the next iteration's slewPTSDelta tracks media-time progression rather
+	// than output-space movement — see preSlewPTS comment for why.
+	//
+	// Anchor lastTS / lastWallPTS / lastSlewPTS on forward (signedRTPDelta >= 0)
+	// progression only — matches the lastNtpPTS guard above. A backward
+	// (reordered) packet would otherwise leave the next iteration's
+	// expectedRawNtpPTS (uses lastNtpPTS + (ts - lastTS) extrapolation) reading
+	// from mismatched baselines, and would feed a large positive slewPTSDelta
+	// into the decay loop on the next forward packet — burning slew far faster
+	// than intended. lastPTSAdjusted updates unconditionally so monotonicity
+	// always sees the most recently emitted PTS.
+	if signedRTPDelta >= 0 {
+		st.lastTS = ts
+		st.lastWallPTS = wallPTS
+		st.lastSlewPTS = preSlewPTS
+	}
+	st.lastPTSAdjusted = pts
+	st.hasEmitted = true
+
+	return pts, nil
+}
+
+// wallClockPTS computes a PTS based on wall-clock timing and RTP deltas.
+// Independent of NTP corrections — used as a sanity reference for NTP-derived PTS.
+func (st *syncEngineTrack) wallClockPTS(pkt jitter.ExtPacket) time.Duration {
+	return st.wallClockPTSForRTPLocked(pkt.Timestamp, pkt.ReceivedAt)
+}
+
+// wallClockPTSForRTP returns the PTS that would be assigned to an SR's RTP timestamp without emitting it.
+func (st *syncEngineTrack) wallClockPTSForRTP(ts uint32, receivedAt time.Time) (time.Duration, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// closed: closeLocked may have run between OnRTCP releasing st.mu and us reacquiring it; a phantom wallPTS here would arm a tempo correction against audio that is already gone.
+	if !st.initialized || st.closed {
+		return 0, false
+	}
+	return st.wallClockPTSForRTPLocked(ts, receivedAt), true
+}
+
+// wallClockPTSForRTPLocked is the lock-held implementation of wall-clock PTS
+// computation. Caller must hold st.mu.
+func (st *syncEngineTrack) wallClockPTSForRTPLocked(ts uint32, receivedAt time.Time) time.Duration {
+	// Defense in depth: if receivedAt is the zero time.Time, wallElapsed
+	// below would be a ~63-billion-second negative duration, the sanity
+	// threshold would reject rtpDerived, and the function would return 0
+	// regardless of sessionOffset — locking the trust-threshold clamp onto
+	// a bogus baseline. initializeLocked already substitutes time.Now() for
+	// zero ReceivedAt on the first packet; do the same here in case a later
+	// caller (e.g., OnRTCP using sr.RTPTime + an unset receivedAt) misses it.
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
+
+	// Wall-clock elapsed since this track started, plus session offset
+	wallElapsed := receivedAt.Sub(st.startTime) + st.sessionOffset
+
+	// If we have processed at least one packet, use RTP delta from the previous
+	// pure-wall-clock baseline for more precision (immune to receivedAt jitter).
+	// uint32 subtraction wraps for backward RTP timestamps; the sanity check
+	// below catches the resulting huge positive delta and falls back to wall clock.
+	if st.initialized {
+		rtpDelta := ts - st.lastTS
+		rtpDerived := st.lastWallPTS + st.converter.ToDuration(rtpDelta)
+
+		// Sanity check: if RTP-derived PTS diverges from wall-clock by > 5s, use wall clock.
+		diff := rtpDerived - wallElapsed
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= wallClockSanityThreshold {
+			return rtpDerived
+		}
+	}
+
+	// Use wall-clock elapsed, ensuring non-negative.
+	if wallElapsed < 0 {
+		wallElapsed = 0
+	}
+	return wallElapsed
+}
+
+// OnSenderReport implements TrackSync. It stores a callback invoked on sender reports.
+func (st *syncEngineTrack) OnSenderReport(f func(drift time.Duration)) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.onSR = f
+}
+
+// LastPTSAdjusted implements TrackSync.
+func (st *syncEngineTrack) LastPTSAdjusted() time.Duration {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastPTSAdjusted
+}
+
+// Close implements TrackSync.
+func (st *syncEngineTrack) Close() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.closeLocked()
+}
+
+// closeLocked is the lock-held implementation of Close. Caller must hold st.mu.
+// Used by SyncEngine.removeTrackLocked to inline the close action within the
+// same critical section that snapshots lastPTSAdjusted, eliminating the race
+// window between snapshot and close.
+//
+// Closing only stops FUTURE OnRTCP invocations (which check st.closed before
+// the timeline call). An OnRTCP that has already acquired st.mu and read
+// st.onSR into a local before closeLocked can run will still invoke that
+// captured callback once after close — st.mu serializes the two but the
+// callback function pointer is already copied. Consumers must therefore
+// tolerate one final SR callback per RemoveTrack/Close. Tightening this
+// would require holding st.mu across the user-supplied callback, which is
+// an unacceptable constraint on what the callback may do.
+func (st *syncEngineTrack) closeLocked() {
+	st.closed = true
+	// Clear the field too: OnRTCP invocations that arrive AFTER close and
+	// somehow pass the closed check would see nil. Also helps GC release
+	// any state captured by the callback closure.
+	st.onSR = nil
+}

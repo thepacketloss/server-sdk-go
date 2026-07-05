@@ -17,17 +17,21 @@ package signalling
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/livekit/mediatransportutil/pkg/pacer"
 	"github.com/livekit/protocol/livekit"
-	protoLogger "github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/logger"
+	e2eetypes "github.com/livekit/server-sdk-go/v2/e2ee/types"
+	dtlsElliptic "github.com/pion/dtls/v3/pkg/crypto/elliptic"
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/protobuf/proto"
 )
 
 type Signalling interface {
-	SetLogger(l protoLogger.Logger)
+	SetLogger(l logger.Logger)
 
 	Path() string
 	ValidatePath() string
@@ -71,6 +75,8 @@ type ConnectParams struct {
 	AutoSubscribe          bool
 	Reconnect              bool
 	DisableRegionDiscovery bool
+	// timeout for each connection attempt, default is 5 seconds
+	ConnectTimeout time.Duration
 
 	RetransmitBufferSize uint16
 
@@ -86,12 +92,43 @@ type ConnectParams struct {
 
 	ICETransportPolicy webrtc.ICETransportPolicy
 
+	// DisableTURN removes TURN/TURNS URLs from the ICE server list provided by the SFU.
+	// Use this when the client is co-located with the SFU and does not need relay candidates.
+	DisableTURN bool
+
+	// IPv6Only restricts ICE to IPv6. Only IPv6 local candidates are gathered
+	// (and sent to the server), and any IPv4 remote candidates from the server
+	// are rejected before being added to the ICE agent.
+	IPv6Only bool
+
+	DTLSEllipticCurves []dtlsElliptic.Curve // FIPS 140: override default DTLS curves
+
+	// DataEncryptionKeyProvider enables data channel E2EE when set.
+	DataEncryptionKeyProvider e2eetypes.KeyProvider
+
+	// UseSinglePeerConnection enables single peer connection mode in which the
+	// publisher PC is reused for both publishing and receiving media.
+	UseSinglePeerConnection bool
+
 	// internal use
 	Codecs []webrtc.RTPCodecParameters
+
+	Logger logger.Logger
+}
+
+func (c ConnectParams) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	e.AddBool("AutoSubscribe", c.AutoSubscribe)
+	e.AddBool("Reconnect", c.Reconnect)
+	e.AddBool("DisableRegionDiscovery", c.DisableRegionDiscovery)
+	e.AddDuration("ConnectTimeout", c.ConnectTimeout)
+	e.AddUint16("RetransmitBufferSize", c.RetransmitBufferSize)
+	e.AddBool("DisableTURN", c.DisableTURN)
+	e.AddBool("UseSinglePeerConnection", c.UseSinglePeerConnection)
+	return nil
 }
 
 type SignalTransport interface {
-	SetLogger(l protoLogger.Logger)
+	SetLogger(l logger.Logger)
 
 	Start()
 	IsStarted() bool
@@ -105,6 +142,7 @@ type SignalTransport interface {
 		publisherOffer webrtc.SessionDescription,
 	) error
 	Reconnect(
+		ctx context.Context,
 		url string,
 		token string,
 		connectParams ConnectParams,
@@ -118,7 +156,7 @@ type SignalTransportHandler interface {
 }
 
 type SignalHandler interface {
-	SetLogger(l protoLogger.Logger)
+	SetLogger(l logger.Logger)
 
 	HandleMessage(msg proto.Message) error
 }

@@ -17,6 +17,7 @@ package lksdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"strings"
@@ -36,11 +37,13 @@ import (
 	"github.com/livekit/protocol/livekit"
 	protoLogger "github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/utils/guid"
+	e2eetypes "github.com/livekit/server-sdk-go/v2/e2ee/types"
 )
 
 const (
-	rtpOutboundMTU = 1200
-	rtpInboundMTU  = 1500
+	rtpOutboundMTU    = 1200
+	rtpInboundMTU     = 1500
+	absCaptureTimeURI = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
 )
 
 var (
@@ -57,33 +60,37 @@ type SampleWriteOptions struct {
 // publishing tracks at the right frequency
 // This extends webrtc.TrackLocalStaticSample, and adds the ability to write RTP extensions
 type LocalTrack struct {
-	log              protoLogger.Logger
-	packetizer       rtp.Packetizer
-	sequencer        rtp.Sequencer
-	transceiver      *webrtc.RTPTransceiver
-	rtpTrack         *webrtc.TrackLocalStaticRTP
-	ssrc             webrtc.SSRC
-	ssrcAcked        bool
-	clockRate        float64
-	bound            atomic.Bool
-	lock             sync.RWMutex
-	writeStartupLock sync.Mutex
-	audioLevelID     uint8
-	sdesMidID        uint8
-	sdesRtpStreamID  uint8
-	lastTS           time.Time
-	lastRTPTimestamp uint32
-	simulcastID      string
-	videoLayer       *livekit.VideoLayer
-	onRTCP           func(rtcp.Packet)
+	log                      protoLogger.Logger
+	packetizer               rtp.Packetizer
+	sequencer                rtp.Sequencer
+	transceiver              *webrtc.RTPTransceiver
+	rtpTrack                 *webrtc.TrackLocalStaticRTP
+	ssrc                     webrtc.SSRC
+	ssrcAcked                bool
+	clockRate                float64
+	bound                    atomic.Bool
+	lock                     sync.RWMutex
+	writeStartupLock         sync.Mutex
+	audioLevelID             uint8
+	sdesMidID                uint8
+	sdesRtpStreamID          uint8
+	incomingAbsCaptureTimeID uint8
+	absCaptureTimeID         uint8
+	lastTS                   time.Time
+	lastRTPTimestamp         uint32
+	simulcastID              string
+	videoLayer               *livekit.VideoLayer
+	onRTCP                   func(rtcp.Packet)
 
-	muted        atomic.Bool
-	disconnected atomic.Bool
-	cancelWrite  func()
-	writeClosed  chan struct{}
-	provider     SampleProvider
-	onBind       func()
-	onUnbind     func()
+	muted          atomic.Bool
+	disabled       atomic.Bool
+	disconnected   atomic.Bool
+	cancelWrite    func()
+	writeClosed    chan struct{}
+	provider       SampleProvider
+	frameEncryptor e2eetypes.FrameEncryptor // nil = no encryption
+	onBind         func()
+	onUnbind       func()
 	// notify when sample provider responds with EOF
 	onWriteComplete func()
 }
@@ -98,6 +105,16 @@ func WithSimulcast(simulcastID string, layer *livekit.VideoLayer) LocalTrackOpti
 	return func(s *LocalTrack) {
 		s.videoLayer = layer
 		s.simulcastID = simulcastID
+	}
+}
+
+// WithFrameEncryptor sets a frame-level encryptor for the track.
+// When set, all samples written via WriteSample are encrypted before
+// RTP packetization. Use NewAudioFrameEncryptor, NewH264FrameEncryptor,
+// or NewH265FrameEncryptor to create a suitable encryptor.
+func WithFrameEncryptor(enc e2eetypes.FrameEncryptor) LocalTrackOptions {
+	return func(s *LocalTrack) {
+		s.frameEncryptor = enc
 	}
 }
 
@@ -216,6 +233,10 @@ func (s *LocalTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters
 		if ext.URI == sdp.SDESRTPStreamIDURI {
 			s.sdesRtpStreamID = uint8(ext.ID)
 		}
+
+		if ext.URI == absCaptureTimeURI {
+			s.absCaptureTimeID = uint8(ext.ID)
+		}
 	}
 	s.sequencer = rtp.NewRandomSequencer()
 	s.packetizer = rtp.NewPacketizer(
@@ -226,7 +247,7 @@ func (s *LocalTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters
 		s.sequencer,
 		codec.ClockRate,
 	)
-	s.clockRate = float64(codec.RTPCodecCapability.ClockRate)
+	s.clockRate = float64(codec.ClockRate)
 	onBind := s.onBind
 	provider := s.provider
 	onWriteComplete := s.onWriteComplete
@@ -316,12 +337,22 @@ func (s *LocalTrack) OnUnbind(f func()) {
 	s.lock.Unlock()
 }
 
+// This is used to translate abs-capture-time extension before writing to a peer connection when source provided
+// extension ID does not match negotiated extension ID on the peer connection
+func (s *LocalTrack) SetIncomingAbsCaptureTimeExtensionID(id uint8) {
+	s.lock.Lock()
+	s.incomingAbsCaptureTimeID = id
+	s.lock.Unlock()
+}
+
 // WriteRTP writes an RTP packet to the track with optional sample write options.
 func (s *LocalTrack) WriteRTP(p *rtp.Packet, opts *SampleWriteOptions) error {
 	s.lock.RLock()
 	transceiver := s.transceiver
 	ssrcAcked := s.ssrcAcked
 	audioLevelID := s.audioLevelID
+	incomingAbsCaptureTimeID := s.incomingAbsCaptureTimeID
+	absCaptureTimeID := s.absCaptureTimeID
 	s.lock.RUnlock()
 
 	if audioLevelID != 0 && opts != nil && opts.AudioLevel != nil {
@@ -332,8 +363,15 @@ func (s *LocalTrack) WriteRTP(p *rtp.Packet, opts *SampleWriteOptions) error {
 		if err != nil {
 			return err
 		}
-		if err := p.Header.SetExtension(audioLevelID, data); err != nil {
+		if err := p.SetExtension(audioLevelID, data); err != nil {
 			return err
+		}
+	}
+
+	if incomingAbsCaptureTimeID != 0 && absCaptureTimeID != 0 && incomingAbsCaptureTimeID != absCaptureTimeID && p.Extension {
+		if data := p.GetExtension(incomingAbsCaptureTimeID); len(data) != 0 {
+			_ = p.DelExtension(incomingAbsCaptureTimeID)
+			_ = p.SetExtension(absCaptureTimeID, data)
 		}
 	}
 
@@ -345,14 +383,14 @@ func (s *LocalTrack) WriteRTP(p *rtp.Packet, opts *SampleWriteOptions) error {
 
 		if sdesMidID != 0 {
 			midValue := transceiver.Mid()
-			if err := p.Header.SetExtension(sdesMidID, []byte(midValue)); err != nil {
+			if err := p.SetExtension(sdesMidID, []byte(midValue)); err != nil {
 				return err
 			}
 		}
 
 		if sdesRtpStreamID != 0 {
 			ridValue := s.RID()
-			if err := p.Header.SetExtension(sdesRtpStreamID, []byte(ridValue)); err != nil {
+			if err := p.SetExtension(sdesRtpStreamID, []byte(ridValue)); err != nil {
 				return err
 			}
 		}
@@ -486,7 +524,17 @@ func (s *LocalTrack) WriteSample(sample media.Sample, opts *SampleWriteOptions) 
 		s.packetizer.SkipSamples(skippedSamples)
 	}
 
-	packets := s.packetizer.Packetize(sample.Data, samplesPerPacket)
+	data := sample.Data
+	if s.frameEncryptor != nil {
+		var err error
+		data, err = s.frameEncryptor.EncryptFrame(data)
+		if err != nil {
+			s.lock.Unlock()
+			return fmt.Errorf("frame encryption: %w", err)
+		}
+	}
+
+	packets := s.packetizer.Packetize(data, samplesPerPacket)
 
 	s.lastTS = sample.Timestamp
 	s.lastRTPTimestamp = currentRTPTimestamp
@@ -535,6 +583,10 @@ func (s *LocalTrack) SSRC() webrtc.SSRC {
 
 func (s *LocalTrack) setMuted(muted bool) {
 	s.muted.Store(muted)
+}
+
+func (s *LocalTrack) setDisabled(disabled bool) {
+	s.disabled.Store(disabled)
 }
 
 func (s *LocalTrack) setDisconnected(disconnected bool) {
@@ -624,7 +676,7 @@ func (s *LocalTrack) writeWorker(provider SampleProvider, onComplete func()) {
 			return
 		}
 
-		if !s.muted.Load() {
+		if !s.muted.Load() && !s.disabled.Load() {
 			var opts *SampleWriteOptions
 			if isAudioProvider {
 				level := audioProvider.CurrentAudioLevel()

@@ -17,8 +17,10 @@ package lksdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	protoLogger "github.com/livekit/protocol/logger"
 	protosignalling "github.com/livekit/protocol/signalling"
 
+	"github.com/livekit/server-sdk-go/v2/e2ee"
 	"github.com/livekit/server-sdk-go/v2/signalling"
 )
 
@@ -39,7 +42,7 @@ import (
 type engineHandler interface {
 	OnLocalTrackUnpublished(response *livekit.TrackUnpublishedResponse)
 	OnTrackRemoteMuted(request *livekit.MuteTrackRequest)
-	OnDisconnected(reason DisconnectionReason)
+	OnDisconnected(protoReason livekit.DisconnectReason)
 	OnMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
 	OnParticipantUpdate([]*livekit.ParticipantInfo)
 	OnSpeakersChanged([]*livekit.SpeakerInfo)
@@ -91,6 +94,12 @@ const (
 	maxReconnectCount        = 10
 	initialReconnectInterval = 300 * time.Millisecond
 	maxReconnectInterval     = 60 * time.Second
+
+	// Number of recvonly transceivers pre-allocated on the publisher PC in
+	// single peer connection mode so auto-subscribed media has m-sections
+	// ready in the initial offer.
+	initialMediaSectionsAudio = 3
+	initialMediaSectionsVideo = 3
 )
 
 type RTCEngine struct {
@@ -120,27 +129,23 @@ type RTCEngine struct {
 	trackPublishedListenersLock sync.Mutex
 	trackPublishedListeners     map[string]chan *livekit.TrackPublishedResponse
 
-	subscriberPrimary     bool
-	hasConnected          atomic.Bool
-	hasPublish            atomic.Bool
-	closed                atomic.Bool
-	reconnecting          atomic.Bool
-	requiresFullReconnect atomic.Bool
+	subscriberPrimary bool
+	hasPublish        atomic.Bool
+	closed            atomic.Bool
 
-	url        string
-	token      atomic.String
-	connParams *signalling.ConnectParams
-
-	joinTimeout time.Duration
+	dataCryptor *e2ee.DataCryptor // E2EE data channel encryption (nil = disabled)
 
 	onClose     []func()
 	onCloseLock sync.Mutex
+
+	*connectionManager
 }
 
 func NewRTCEngine(
 	useSinglePeerConnection bool,
 	engineHandler engineHandler,
 	getLocalParticipantSID func() string,
+	regionProvider *regionURLProvider,
 ) *RTCEngine {
 	e := &RTCEngine{
 		log:                      logger,
@@ -148,22 +153,32 @@ func NewRTCEngine(
 		engineHandler:            engineHandler,
 		cbGetLocalParticipantSID: getLocalParticipantSID,
 		trackPublishedListeners:  make(map[string]chan *livekit.TrackPublishedResponse),
-		joinTimeout:              15 * time.Second,
 		reliableMsgSeq:           1,
-	}
-	if !useSinglePeerConnection {
-		e.signalling = signalling.NewSignalling(signalling.SignallingParams{
-			Logger: e.log,
-		})
-	} else {
-		e.signalling = signalling.NewSignallingJoinRequest(signalling.SignallingJoinRequestParams{
-			Logger: e.log,
-		})
+		connectionManager:        newConnectionManager(regionProvider),
 	}
 	e.signalHandler = signalling.NewSignalHandler(signalling.SignalHandlerParams{
 		Logger:    e.log,
 		Processor: e,
 	})
+	e.configureSignalling(useSinglePeerConnection)
+
+	return e
+}
+
+func (e *RTCEngine) configureSignalling(useSinglePeerConnection bool) {
+	e.useSinglePeerConnection = useSinglePeerConnection
+	if useSinglePeerConnection {
+		e.signalling = signalling.NewSignallingJoinRequest(signalling.SignallingJoinRequestParams{
+			Logger: e.log,
+		})
+	} else {
+		e.signalling = signalling.NewSignalling(signalling.SignallingParams{
+			Logger: e.log,
+		})
+	}
+	if e.signalTransport != nil {
+		e.signalTransport.Close()
+	}
 	e.signalTransport = signalling.NewSignalTransportWebSocket(signalling.SignalTransportWebSocketParams{
 		Logger:                 e.log,
 		Version:                Version,
@@ -172,14 +187,12 @@ func NewRTCEngine(
 		SignalTransportHandler: e,
 		SignalHandler:          e.signalHandler,
 	})
-
-	e.onClose = []func(){}
-	return e
 }
 
 // SetLogger overrides default logger.
 func (e *RTCEngine) SetLogger(l protoLogger.Logger) {
 	e.log = l
+	e.connectionManager.setLogger(l)
 	e.signalling.SetLogger(l)
 	e.signalHandler.SetLogger(l)
 	e.signalTransport.SetLogger(l)
@@ -191,46 +204,146 @@ func (e *RTCEngine) SetLogger(l protoLogger.Logger) {
 	}
 }
 
-func (e *RTCEngine) JoinContext(
-	ctx context.Context,
-	url string,
-	token string,
-	connectParams *signalling.ConnectParams,
-) (bool, error) {
-	e.url = url
-	e.token.Store(token)
-	e.connParams = connectParams
+func (e *RTCEngine) join(
+	publishWithJoin func() ([]*livekit.AddTrackRequest, error),
+	cleanupPublishWithJoinOnError func(),
+) error {
+	cleanupPublish := func() {
+		if cleanupPublishWithJoinOnError != nil {
+			cleanupPublishWithJoinOnError()
+		}
+	}
 
-	var (
-		publisherOffer webrtc.SessionDescription
-		err            error
-	)
-	if e.signalling.PublishInJoin() {
-		e.pclock.Lock()
-		e.createPublisherPCLocked(webrtc.Configuration{})
+	plan, err := e.connectionManager.getConnectionPlan()
+	if err != nil {
+		e.log.Errorw("could not get connection plan to join", err)
+		return err
+	}
 
-		publisherOffer, err = e.publisher.GetLocalOffer()
-		if err != nil {
+	connParams := e.connectionManager.getConnectParams()
+	connectTimeout := e.connectionManager.getConnectTimeout()
+
+	var errorToReport error
+	for _, attempt := range plan {
+		e.log.Infow("attempting join plan", "attempt", attempt, "connParams", connParams)
+
+		// apply any backoff wait before attempting to connect
+		if attempt.backoffWait > 0 {
+			select {
+			case <-time.After(attempt.backoffWait):
+			case <-attempt.ctx.Done():
+				return attempt.ctx.Err()
+			}
+		}
+
+		var (
+			publisherOffer   webrtc.SessionDescription
+			err              error
+			addTrackRequests []*livekit.AddTrackRequest
+		)
+		if e.signalling.PublishInJoin() {
+			e.pclock.Lock()
+
+			// clear & recreate publisher pc to ensure a clean slate for the publisher offer and any pre-added m-sections.
+			e.closePeerConnectionsLocked()
+			if err = e.createPublisherPCLocked(webrtc.Configuration{}); err != nil {
+				e.pclock.Unlock()
+				return err
+			}
+
+			if err = e.addInitialMediaSectionsLocked(initialMediaSectionsAudio, initialMediaSectionsVideo); err != nil {
+				e.pclock.Unlock()
+				return err
+			}
 			e.pclock.Unlock()
-			return false, err
+
+			if publishWithJoin != nil {
+				if addTrackRequests, err = publishWithJoin(); err != nil {
+					cleanupPublish()
+					return err
+				}
+			}
+
+			e.pclock.Lock()
+			publisherOffer, err = e.publisher.GetLocalOffer()
+			if err != nil {
+				e.pclock.Unlock()
+				cleanupPublish()
+				return err
+			}
+
+			e.pendingPublisherOffer = publisherOffer
+			e.pclock.Unlock()
 		}
-		e.pendingPublisherOffer = publisherOffer
-		e.pclock.Unlock()
-	}
 
-	if err = e.signalTransport.Join(ctx, url, token, *connectParams, nil, publisherOffer); err != nil {
-		if verr := e.validate(ctx, url, token, connectParams, ""); verr != nil {
-			return false, verr
+		// if context is cancelled, return early,
+		// could happen if incoming context had a deadline or is cancelled externally
+		if err = attempt.ctx.Err(); err != nil {
+			cleanupPublish()
+			return err
 		}
-		return false, ErrCannotConnectSignal
+
+		// WithTimeout is already bounded by attempt.ctx, so the caller's deadline
+		// (if any) is still honored.
+		joinCtx, joinCtxCancel := context.WithTimeout(attempt.ctx, connectTimeout)
+		err = e.signalTransport.Join(
+			joinCtx,
+			attempt.region.Url,
+			attempt.token,
+			connParams,
+			addTrackRequests,
+			publisherOffer,
+		)
+		joinCtxCancel()
+		if err != nil {
+			e.log.Infow("signal transport join failed", "error", err, "attempt", attempt, "connParams", connParams)
+
+			validateCtx, validateCtxCancel := context.WithTimeout(context.Background(), attempt.validateTimeout)
+			verr := e.validate(
+				validateCtx,
+				attempt.region.Url,
+				attempt.token,
+				&connParams,
+				"",
+			)
+			validateCtxCancel()
+			if verr != nil {
+				// the endpoint is unreachable/invalid; report the validate error
+				e.log.Infow("signal transport validate failed", "error", verr, "attempt", attempt, "connParams", connParams)
+				errorToReport = verr
+			} else {
+				// the endpoint validates but the signal join failed
+				errorToReport = ErrCannotConnectSignal
+			}
+			e.cleanupConnection()
+			cleanupPublish()
+			continue
+		}
+
+		// use left over time after signal transport connection to wait for peer connection to establish
+		timeout := time.Duration(0)
+		if deadline, ok := joinCtx.Deadline(); ok {
+			timeout = max(0, time.Until(deadline))
+		}
+		if err = e.waitUntilConnected(timeout); err != nil {
+			e.cleanupConnection()
+			errorToReport = err
+			cleanupPublish()
+			e.log.Infow("waiting for connection establishment failed", "error", err, "attempt", attempt, "connParams", connParams, "timeout", timeout)
+			continue
+		}
+
+		e.connectionManager.setConnected(attempt.region)
+		return nil
 	}
 
-	if err = e.waitUntilConnected(); err != nil {
-		return false, err
+	if errorToReport == nil {
+		// defensive: reaching here means no attempt connected, so never report
+		// success (guards an empty plan or a future failure branch that forgets
+		// to record an error)
+		errorToReport = ErrCannotConnectSignal
 	}
-
-	e.hasConnected.Store(true)
-	return true, nil
+	return errorToReport
 }
 
 func (e *RTCEngine) OnClose(onClose func()) {
@@ -244,8 +357,14 @@ func (e *RTCEngine) Close() {
 		return
 	}
 
+	e.connectionManager.setClosed()
+
+	e.pclock.Lock()
+	e.pendingPublisherOffer = webrtc.SessionDescription{}
+	e.pclock.Unlock()
+
 	go func() {
-		for e.reconnecting.Load() {
+		for e.connectionManager.isRecovering() {
 			time.Sleep(50 * time.Millisecond)
 		}
 
@@ -340,16 +459,19 @@ func (e *RTCEngine) configure(
 }
 
 func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) error {
+	connParams := e.connectionManager.getConnectParams()
 	var err error
 	if e.publisher, err = NewPCTransport(PCTransportParams{
 		Configuration:              configuration,
-		Codecs:                     e.connParams.Codecs,
-		RetransmitBufferSize:       e.connParams.RetransmitBufferSize,
-		Pacer:                      e.connParams.Pacer,
-		Interceptors:               e.connParams.Interceptors,
-		IncludeDefaultInterceptors: e.connParams.IncludeDefaultInterceptors,
+		Codecs:                     connParams.Codecs,
+		RetransmitBufferSize:       connParams.RetransmitBufferSize,
+		Pacer:                      connParams.Pacer,
+		Interceptors:               connParams.Interceptors,
+		IncludeDefaultInterceptors: connParams.IncludeDefaultInterceptors,
 		OnRTTUpdate:                e.setRTT,
 		IsSender:                   true,
+		DTLSEllipticCurves:         connParams.DTLSEllipticCurves,
+		IPv6Only:                   connParams.IPv6Only,
 	}); err != nil {
 		return err
 	}
@@ -396,6 +518,12 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 		}
 	}
 
+	if e.useSinglePeerConnection {
+		e.publisher.pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+			e.engineHandler.OnMediaTrack(remote, receiver)
+		})
+	}
+
 	trueVal := true
 	falseVal := false
 	maxRetries := uint16(1)
@@ -423,18 +551,39 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 	return nil
 }
 
+func (e *RTCEngine) addInitialMediaSectionsLocked(numAudio, numVideo int) error {
+	if e.publisher == nil {
+		return nil
+	}
+	init := webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}
+	for i := 0; i < numAudio; i++ {
+		if _, err := e.publisher.pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, init); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < numVideo; i++ {
+		if _, err := e.publisher.pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, init); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *RTCEngine) createSubscriberPCLocked(configuration webrtc.Configuration) error {
 	if e.useSinglePeerConnection {
 		return nil
 	}
 
+	connParams := e.connectionManager.getConnectParams()
 	var err error
 	if e.subscriber, err = NewPCTransport(PCTransportParams{
 		Configuration:              configuration,
-		Codecs:                     e.connParams.Codecs,
-		RetransmitBufferSize:       e.connParams.RetransmitBufferSize,
-		Interceptors:               e.connParams.Interceptors,
-		IncludeDefaultInterceptors: e.connParams.IncludeDefaultInterceptors,
+		Codecs:                     connParams.Codecs,
+		RetransmitBufferSize:       connParams.RetransmitBufferSize,
+		Interceptors:               connParams.Interceptors,
+		IncludeDefaultInterceptors: connParams.IncludeDefaultInterceptors,
+		DTLSEllipticCurves:         connParams.DTLSEllipticCurves,
+		IPv6Only:                   connParams.IPv6Only,
 	}); err != nil {
 		return err
 	}
@@ -508,11 +657,13 @@ func (e *RTCEngine) handleICEConnectionStateChange(
 			fields = append(fields, "transport", signalTarget, "iceCandidatePair", pair)
 		}
 		e.log.Debugw("ICE connected", fields...)
+
 	case webrtc.ICEConnectionStateDisconnected:
 		e.log.Debugw("ICE disconnected", "transport", signalTarget)
+
 	case webrtc.ICEConnectionStateFailed:
 		e.log.Debugw("ICE failed", "transport", signalTarget)
-		e.handleDisconnect(false)
+		e.handleDisconnect("ice-failed", false, nil)
 	}
 }
 
@@ -520,10 +671,16 @@ func (e *RTCEngine) closePeerConnections() {
 	e.pclock.Lock()
 	defer e.pclock.Unlock()
 
+	e.closePeerConnectionsLocked()
+}
+
+func (e *RTCEngine) closePeerConnectionsLocked() {
 	if e.publisher != nil {
 		e.publisher.Close()
 		e.publisher = nil
 	}
+	e.pendingPublisherOffer = webrtc.SessionDescription{}
+	e.hasPublish.Store(false)
 
 	if e.subscriber != nil {
 		e.subscriber.Close()
@@ -549,34 +706,9 @@ func (e *RTCEngine) GetDataChannelSub(kind livekit.DataPacket_Kind) *webrtc.Data
 	return e.lossyDCSub
 }
 
-func waitUntilConnected(d time.Duration, test func() bool) error {
-	if test() {
-		return nil
-	}
-
-	timeout := time.NewTimer(d)
-	defer timeout.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timeout.C:
-			return ErrConnectionTimeout
-		case <-ticker.C:
-			if test() {
-				return nil
-			}
-		}
-	}
-}
-
-func (e *RTCEngine) waitUntilConnected() error {
-	return waitUntilConnected(e.joinTimeout, func() bool {
-		if e.IsConnected() {
-			e.requiresFullReconnect.Store(false)
-			return true
-		}
-		return false
+func (e *RTCEngine) waitUntilConnected(timeout time.Duration) error {
+	return waitUntilConnected(timeout, func() bool {
+		return e.IsConnected()
 	})
 }
 
@@ -584,12 +716,13 @@ func (e *RTCEngine) ensurePublisherConnected(ensureDataReady bool) error {
 	e.pclock.Lock()
 	subscriberPrimary := e.subscriberPrimary
 	e.pclock.Unlock()
+	connectTimeout := e.connectionManager.getConnectTimeout()
 	if !subscriberPrimary {
-		return e.waitUntilConnected()
+		return e.waitUntilConnected(connectTimeout)
 	}
 
 	var negotiated bool
-	return waitUntilConnected(e.joinTimeout, func() bool {
+	return waitUntilConnected(connectTimeout, func() bool {
 		if publisher, ok := e.Publisher(); ok {
 			if publisher.IsConnected() && (!ensureDataReady || e.dataPubChannelReady()) {
 				return true
@@ -626,6 +759,21 @@ func (e *RTCEngine) handleDataPacket(msg webrtc.DataChannelMessage) {
 	if err != nil {
 		return
 	}
+
+	// Decrypt if data channel E2EE is enabled and this is an encrypted packet.
+	if ep, ok := packet.Value.(*livekit.DataPacket_EncryptedPacket); ok {
+		if e.dataCryptor == nil {
+			e.log.Errorw("received encrypted data packet but no data cryptor is configured, dropping packet", nil)
+			return
+		}
+		payload, err := e.dataCryptor.Decrypt(ep.EncryptedPacket)
+		if err != nil {
+			e.log.Warnw("data decryption failed, dropping packet", err)
+			return
+		}
+		decryptedPayloadToDataPacketValue(packet, payload)
+	}
+
 	identity := packet.ParticipantIdentity
 	switch msg := packet.Value.(type) {
 	case *livekit.DataPacket_User:
@@ -690,45 +838,72 @@ func (e *RTCEngine) readDataPacket(msg webrtc.DataChannelMessage) (*livekit.Data
 	return dataPacket, err
 }
 
-func (e *RTCEngine) handleDisconnect(fullReconnect bool) {
-	// do not retry until fully connected
-	if e.closed.Load() || !e.hasConnected.Load() {
+func (e *RTCEngine) handleDisconnect(reason string, fullReconnect bool, regionSettings *livekit.RegionSettings) {
+	e.log.Debugw(
+		"handling disconnect",
+		"reason", reason,
+		"fullReconnect", fullReconnect,
+		"regionSettings", regionSettings,
+		"closed", e.closed.Load(),
+	)
+
+	if e.closed.Load() {
+		e.log.Infow(
+			"ignoring disconnect",
+			"reason", reason,
+			"fullReconnect", fullReconnect,
+			"regionSettings", regionSettings,
+			"closed", e.closed.Load(),
+		)
 		return
 	}
 
-	if !e.reconnecting.CompareAndSwap(false, true) {
-		if fullReconnect {
-			e.requiresFullReconnect.Store(true)
-		}
+	// requestRecovery applies the transition and reports whether this call must
+	// start the worker; if one is already running it will act on the new state.
+	if !e.connectionManager.requestRecovery(fullReconnect, regionSettings) {
 		return
 	}
 
 	go func() {
-		defer e.reconnecting.Store(false)
 		for reconnectCount := 0; reconnectCount < maxReconnectCount && !e.closed.Load(); reconnectCount++ {
-			if e.requiresFullReconnect.Load() {
-				fullReconnect = true
-			}
-			if fullReconnect {
+			if e.connectionManager.isReconnectingState() {
 				if reconnectCount == 0 {
 					e.engineHandler.OnRestarting()
 				}
 				e.log.Infow("restarting connection...", "reconnectCount", reconnectCount)
-				if err := e.restartConnection(); err != nil {
-					e.log.Errorw("restart connection failed", err)
-				} else {
+				err := e.restartConnection()
+				if err == nil {
+					// a new disconnect may have arrived while settling; if so,
+					// keep the worker running
+					if e.connectionManager.recoveryWorkerShouldContinue() {
+						reconnectCount = 0
+						continue
+					}
 					return
 				}
+				e.log.Errorw("restart connection failed", err)
 			} else {
 				if reconnectCount == 0 {
 					e.engineHandler.OnResuming()
 				}
 				e.log.Infow("resuming connection...", "reconnectCount", reconnectCount)
-				if err := e.resumeConnection(); err != nil {
-					e.log.Errorw("resume connection failed", err)
-				} else {
+				err := e.resumeConnection()
+				if err == nil {
+					// a reconnect leave (or another disconnect) may have arrived
+					// while resume was settling; if so, keep the worker running
+					if e.connectionManager.recoveryWorkerShouldContinue() {
+						reconnectCount = 0
+						continue
+					}
 					return
 				}
+
+				e.log.Errorw("resume connection failed", err)
+				// escalate to a full reconnect so region failover engages
+				// instead of retrying resume against the same (dead) region
+				e.connectionManager.setReconnecting(nil)
+				reconnectCount = 0
+				continue
 			}
 
 			delay := time.Duration(reconnectCount*reconnectCount) * initialReconnectInterval
@@ -736,68 +911,135 @@ func (e *RTCEngine) handleDisconnect(fullReconnect bool) {
 				break
 			}
 			if reconnectCount < maxReconnectCount-1 {
+				e.log.Infow("reconnecting...", "reconnectCount", reconnectCount, "delay", delay)
 				time.Sleep(delay)
 			}
 		}
 
-		e.engineHandler.OnDisconnected(Failed)
+		// gave up (or closed): release the worker slot so a later disconnect can
+		// re-arm recovery, then report the disconnect
+		e.connectionManager.stopRecoveryWorker()
+		e.engineHandler.OnDisconnected(livekit.DisconnectReason_SIGNAL_CLOSE)
 	}()
 }
 
 func (e *RTCEngine) resumeConnection() error {
-	err := e.signalTransport.Reconnect(
-		e.url,
-		e.token.Load(),
-		*e.connParams,
-		e.cbGetLocalParticipantSID(),
-	)
+	plan, err := e.connectionManager.getConnectionPlan()
 	if err != nil {
-		if verr := e.validate(
-			context.TODO(),
-			e.url,
-			e.token.Load(),
-			e.connParams,
-			e.cbGetLocalParticipantSID(),
-		); verr != nil {
-			return verr
-		}
-		return ErrCannotConnectSignal
-	}
-
-	e.signalTransport.Start()
-
-	// send offer if publisher enabled
-	e.pclock.Lock()
-	sendOffer := !e.subscriberPrimary || e.hasPublish.Load()
-	publisher := e.publisher
-	e.pclock.Unlock()
-	if sendOffer {
-		if err := publisher.createAndSendOffer(&webrtc.OfferOptions{
-			ICERestart: true,
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err = e.waitUntilConnected(); err != nil {
+		e.log.Errorw("could not get connection plan to resume connection", err)
 		return err
 	}
 
-	e.engineHandler.OnResumed()
-	return nil
+	connParams := e.connectionManager.getConnectParams()
+	connectTimeout := e.connectionManager.getConnectTimeout()
+
+	var errorToReport error
+	for _, attempt := range plan {
+		e.log.Infow("attempting resume plan", "attempt", attempt, "connParams", connParams)
+
+		// apply any backoff wait before attempting to connect
+		if attempt.backoffWait > 0 {
+			select {
+			case <-time.After(attempt.backoffWait):
+			case <-attempt.ctx.Done():
+				return attempt.ctx.Err()
+			}
+		}
+
+		if err = attempt.ctx.Err(); err != nil {
+			return err
+		}
+
+		// WithTimeout is already bounded by attempt.ctx, so the caller's deadline
+		// (if any) is still honored.
+		resumeCtx, resumeCtxCancel := context.WithTimeout(attempt.ctx, connectTimeout)
+
+		err = e.signalTransport.Reconnect(
+			resumeCtx,
+			attempt.region.Url,
+			attempt.token,
+			connParams,
+			e.cbGetLocalParticipantSID(),
+		)
+		resumeCtxCancel()
+		if err != nil {
+			e.log.Infow("signal transport resume failed", "error", err, "attempt", attempt, "connParams", connParams)
+
+			validateCtx, validateCtxCancel := context.WithTimeout(context.Background(), attempt.validateTimeout)
+			verr := e.validate(
+				validateCtx,
+				attempt.region.Url,
+				attempt.token,
+				&connParams,
+				e.cbGetLocalParticipantSID(),
+			)
+			validateCtxCancel()
+			if verr != nil {
+				// the endpoint is unreachable/invalid; report the validate error
+				e.log.Infow("signal transport validate failed", "error", verr, "attempt", attempt, "connParams", connParams)
+				errorToReport = verr
+			} else {
+				// the endpoint validates but the signal resume failed
+				errorToReport = ErrCannotConnectSignal
+			}
+			continue
+		}
+
+		e.signalTransport.Start()
+
+		// send offer if publisher enabled
+		e.pclock.Lock()
+		sendOffer := !e.subscriberPrimary || e.hasPublish.Load()
+		publisher := e.publisher
+		e.pclock.Unlock()
+		if sendOffer && publisher != nil {
+			if err := publisher.createAndSendOffer(&webrtc.OfferOptions{
+				ICERestart: true,
+			}); err != nil {
+				return err
+			}
+		}
+
+		// use left over time after signal transport connection to wait for peer connection to establish
+		timeout := time.Duration(0)
+		if deadline, ok := resumeCtx.Deadline(); ok {
+			timeout = max(0, time.Until(deadline))
+		}
+		if err = e.waitUntilConnected(timeout); err != nil {
+			e.log.Infow("waiting for connection establishment failed in resume", "error", err, "attempt", attempt, "connParams", connParams, "timeout", timeout)
+			return err
+		}
+
+		// restore steady state so subsequent resumes start from Connected (and pick
+		// up fresh server region settings) and connectedRegion tracks where we are.
+		// setResumed is a no-op if a reconnect was requested while resuming, so it
+		// won't clobber a pending full reconnect.
+		e.connectionManager.setResumed(attempt.region)
+		e.engineHandler.OnResumed()
+		return nil
+	}
+
+	if errorToReport == nil {
+		// defensive: reaching here means no attempt resumed, so never report
+		// success (guards an empty plan or a future failure branch that forgets
+		// to record an error)
+		errorToReport = ErrCannotConnectSignal
+	}
+	return errorToReport
 }
 
-func (e *RTCEngine) restartConnection() error {
+func (e *RTCEngine) cleanupConnection() {
 	if e.signalTransport.IsStarted() {
 		// TODO: special reason for reconnect?
 		e.SendLeaveWithReason(livekit.DisconnectReason_UNKNOWN_REASON)
 	}
 	e.signalTransport.Close()
-
 	e.closePeerConnections()
+}
 
-	_, err := e.JoinContext(context.TODO(), e.url, e.token.Load(), e.connParams)
-	return err
+func (e *RTCEngine) restartConnection() error {
+	e.cleanupConnection()
+	return e.join(nil, nil)
 }
 
 func (e *RTCEngine) createSubscriberPCAnswerAndSend() error {
@@ -822,16 +1064,41 @@ func (e *RTCEngine) createSubscriberPCAnswerAndSend() error {
 }
 
 func (e *RTCEngine) makeRTCConfiguration(iceServers []*livekit.ICEServer, clientConfig *livekit.ClientConfiguration) webrtc.Configuration {
+	connParams := e.connectionManager.getConnectParams()
+	if connParams.DisableTURN {
+		iceServers = filterTURNServers(iceServers)
+	}
 	rtcICEServers := protosignalling.FromProtoIceServers(iceServers)
 	configuration := webrtc.Configuration{
 		ICEServers:         rtcICEServers,
-		ICETransportPolicy: e.connParams.ICETransportPolicy,
+		ICETransportPolicy: connParams.ICETransportPolicy,
 	}
 	if clientConfig != nil &&
 		clientConfig.GetForceRelay() == livekit.ClientConfigSetting_ENABLED {
 		configuration.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
 	return configuration
+}
+
+func filterTURNServers(iceServers []*livekit.ICEServer) []*livekit.ICEServer {
+	var filtered []*livekit.ICEServer
+	for _, server := range iceServers {
+		var urls []string
+		for _, u := range server.Urls {
+			lower := strings.ToLower(u)
+			if !strings.HasPrefix(lower, "turn:") && !strings.HasPrefix(lower, "turns:") {
+				urls = append(urls, u)
+			}
+		}
+		if len(urls) > 0 {
+			filtered = append(filtered, &livekit.ICEServer{
+				Urls:       urls,
+				Username:   server.Username,
+				Credential: server.Credential,
+			})
+		}
+	}
+	return filtered
 }
 
 func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.DataPacket_Kind) error {
@@ -845,6 +1112,15 @@ func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.Data
 	if dc == nil {
 		e.log.Errorw("could not get data channel", nil, "kind", kind)
 		return errors.New("datachannel not found")
+	}
+
+	// Encrypt if data channel E2EE is enabled.
+	if e.dataCryptor != nil {
+		pck, err = e.dataCryptor.Encrypt(pck)
+		if err != nil {
+			e.log.Warnw("data encryption failed, dropping packet", err)
+			return fmt.Errorf("data encryption: %w", err)
+		}
 	}
 
 	if kind == livekit.DataPacket_RELIABLE {
@@ -875,28 +1151,24 @@ func (e *RTCEngine) publishDataPacketLossy(pck *livekit.DataPacket) error {
 }
 
 // TODO: adjust RPC methods to return error on publishDataPacket failure
-func (e *RTCEngine) publishRpcResponse(destinationIdentity, requestId string, payload *string, err *RpcError) error {
+func (e *RTCEngine) publishRpcResponse(destinationIdentity, requestId string, payload []byte, err *RpcError) error {
+	resp := &livekit.DataPacket_RpcResponse{
+		RpcResponse: &livekit.RpcResponse{
+			RequestId: requestId,
+		},
+	}
 	packet := &livekit.DataPacket{
 		DestinationIdentities: []string{destinationIdentity},
-		Value: &livekit.DataPacket_RpcResponse{
-			RpcResponse: &livekit.RpcResponse{
-				RequestId: requestId,
-			},
-		},
+		Value:                 resp,
 	}
 
 	if err != nil {
-		packet.Value.(*livekit.DataPacket_RpcResponse).RpcResponse.Value = &livekit.RpcResponse_Error{
+		resp.RpcResponse.Value = &livekit.RpcResponse_Error{
 			Error: err.toProto(),
 		}
 	} else {
-		if payload == nil {
-			emptyStr := ""
-			payload = &emptyStr
-		}
-
-		packet.Value.(*livekit.DataPacket_RpcResponse).RpcResponse.Value = &livekit.RpcResponse_Payload{
-			Payload: *payload,
+		resp.RpcResponse.Value = &livekit.RpcResponse_Payload{
+			Payload: string(payload),
 		}
 	}
 
@@ -1117,6 +1389,17 @@ func (e *RTCEngine) Simulate(scenario SimulateScenario) {
 				},
 			),
 		)
+
+	case SimulateLeaveRequestFullReconnect:
+		e.signalTransport.SendMessage(
+			e.signalling.SignalSimulateScenario(
+				&livekit.SimulateScenario{
+					Scenario: &livekit.SimulateScenario_LeaveRequestFullReconnect{
+						LeaveRequestFullReconnect: true,
+					},
+				},
+			),
+		)
 	}
 }
 
@@ -1143,7 +1426,7 @@ func (e *RTCEngine) validate(
 	hresp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		e.log.Errorw("error getting validation", err, "httpResponse", hresp)
-		return signalling.ErrCannotDialSignal
+		return err
 	}
 	defer hresp.Body.Close()
 
@@ -1176,15 +1459,12 @@ func (e *RTCEngine) validate(
 
 // signalling.SignalTransportHandler implementation
 func (e *RTCEngine) OnTransportClose() {
-	e.handleDisconnect(false)
+	e.handleDisconnect("transport-close", false, nil)
 }
 
 // signalling.SignalProcessor implementation
 func (e *RTCEngine) OnJoinResponse(res *livekit.JoinResponse) error {
-	isRestarting := false
-	if e.reconnecting.Load() && e.requiresFullReconnect.Load() {
-		isRestarting = true
-	}
+	isRestarting := e.connectionManager.isReconnectingState()
 
 	err := e.configure(res.IceServers, res.ClientConfiguration, proto.Bool(res.SubscriberPrimary))
 	if err != nil {
@@ -1290,9 +1570,10 @@ func (e *RTCEngine) OnTrickle(init webrtc.ICECandidateInit, target livekit.Signa
 		"target", target,
 		"candidate", init.Candidate,
 	)
-	if target == livekit.SignalTarget_PUBLISHER {
+	switch target {
+	case livekit.SignalTarget_PUBLISHER:
 		err = e.publisher.AddICECandidate(init)
-	} else if target == livekit.SignalTarget_SUBSCRIBER {
+	case livekit.SignalTarget_SUBSCRIBER:
 		err = e.subscriber.AddICECandidate(init)
 	}
 	if err != nil {
@@ -1339,23 +1620,28 @@ func (e *RTCEngine) OnTrackRemoteMuted(request *livekit.MuteTrackRequest) {
 }
 
 func (e *RTCEngine) OnTokenRefresh(refreshToken string) {
-	e.token.Store(refreshToken)
+	e.connectionManager.setToken(refreshToken)
 }
 
 func (e *RTCEngine) OnLeave(leave *livekit.LeaveRequest) {
-	e.log.Debugw("received leave request", "action", leave.GetAction())
+	if leave.GetAction() == livekit.LeaveRequest_DISCONNECT {
+		e.log.Debugw("received leave request", "leave", protoLogger.Proto(leave))
+	} else {
+		e.log.Infow("received leave request", "leave", protoLogger.Proto(leave))
+	}
+
 	switch leave.GetAction() {
 	case livekit.LeaveRequest_DISCONNECT:
 		e.Close()
 		reason := leave.GetReason()
 		e.log.Infow("server initiated leave", "reason", reason)
-		e.engineHandler.OnDisconnected(GetDisconnectionReason(reason))
+		e.engineHandler.OnDisconnected(reason)
 
 	case livekit.LeaveRequest_RECONNECT:
-		e.handleDisconnect(true)
+		e.handleDisconnect("leave-reconnect", true, leave.GetRegions())
 
 	case livekit.LeaveRequest_RESUME:
-		e.handleDisconnect(false)
+		e.handleDisconnect("leave-resume", false, leave.GetRegions())
 
 	default:
 	}
@@ -1382,5 +1668,29 @@ func (e *RTCEngine) OnMediaSectionsRequirement(mediaSectionsRequirement *livekit
 func setConfiguration(pcTransport *PCTransport, configuration webrtc.Configuration) {
 	if pcTransport != nil {
 		pcTransport.SetConfiguration(configuration)
+	}
+}
+
+func waitUntilConnected(d time.Duration, test func() bool) error {
+	if test() {
+		return nil
+	}
+
+	timeout := time.NewTimer(d)
+	defer timeout.Stop()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout.C:
+			return ErrConnectionTimeout
+
+		case <-ticker.C:
+			if test() {
+				return nil
+			}
+		}
 	}
 }

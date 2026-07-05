@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -95,9 +96,17 @@ func getLocalIPAddresses() ([]string, error) {
 	return nil, fmt.Errorf("could not find local IP address")
 }
 
+// runs golangci-lint
+func Lint() error {
+	if _, err := exec.LookPath("golangci-lint"); err != nil {
+		return errors.New("golangci-lint is not installed, install instructions: https://golangci-lint.run/docs/welcome/install/")
+	}
+	return mageutil.Run(context.Background(), "golangci-lint run ./...")
+}
+
 func Test() error {
 	fmt.Println("testing local packages...")
-	if err := mageutil.Run(context.Background(), "go test -short ./pkg/... -count=1"); err != nil {
+	if err := mageutil.Run(context.Background(), "go test -short -v ./pkg/... -count=1"); err != nil {
 		return err
 	}
 
@@ -148,7 +157,7 @@ logging:
 
 	fmt.Println("testing...")
 	testflags := os.Getenv("TestFlags")
-	return run(map[string]string{"LIVEKIT_KEYS": testApiKey}, `go test -race `+testflags)
+	return run(map[string]string{"LIVEKIT_KEYS": testApiKey}, `go test -v -race `+testflags)
 }
 
 func run(env map[string]string, commands ...string) error {

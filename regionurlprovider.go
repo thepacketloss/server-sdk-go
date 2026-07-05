@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,99 +18,177 @@ import (
 
 const (
 	regionHostnameProviderSettingsCacheTime = 3 * time.Second
+	// regionDiscoveryTimeout bounds a single /settings/regions fetch so a slow
+	// or unreachable endpoint doesn't stall the failover path.
+	regionDiscoveryTimeout = 2 * time.Second
 )
 
-type regionURLProvider struct {
-	hostnameSettingsCache map[string]*hostnameSettingsCacheItem // hostname -> regionSettings
-
-	mutex      sync.RWMutex
-	httpClient *http.Client
+// regionSettingsURL builds the LiveKit Cloud region-discovery URL for a hostname.
+var regionSettingsURL = func(cloudHostname string) string {
+	return "https://" + cloudHostname + "/settings/regions"
 }
 
-type hostnameSettingsCacheItem struct {
-	regionSettings    *livekit.RegionSettings
-	updatedAt         time.Time
-	regionURLAttempts map[string]int
+// regionURLProvider supplies LiveKit Cloud region lists to the RTC signaling
+// reconnect path. It is a thin token/https adapter over the shared regionCache,
+// adding a default cache TTL and support for server-pushed region lists.
+type regionURLProvider struct {
+	cache *regionCache
 }
 
 func newRegionURLProvider() *regionURLProvider {
-	return &regionURLProvider{
-		hostnameSettingsCache: make(map[string]*hostnameSettingsCacheItem),
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
-	}
+	return &regionURLProvider{cache: newRegionCache()}
 }
 
 func (r *regionURLProvider) RefreshRegionSettings(cloudHostname, token string) error {
-	r.mutex.RLock()
-	hostnameSettings := r.hostnameSettingsCache[cloudHostname]
-	r.mutex.RUnlock()
-
-	if hostnameSettings != nil && time.Since(hostnameSettings.updatedAt) < regionHostnameProviderSettingsCacheTime {
-		return nil
-	}
-
-	settingsURL := "https://" + cloudHostname + "/settings/regions"
-	req, err := http.NewRequest("GET", settingsURL, nil)
-	if err != nil {
-		return errors.New("refreshRegionSettings failed to create request: " + err.Error())
-	}
-	req.Header = http.Header{
-		"Authorization": []string{"Bearer " + token},
-	}
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return errors.New("refreshRegionSettings failed to fetch region settings. http status: " + resp.Status)
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return errors.New("refreshRegionSettings failed to read response body: " + err.Error())
-	}
-	regions := &livekit.RegionSettings{}
-	if err := protojson.Unmarshal(respBody, regions); err != nil {
-		return errors.New("refreshRegionSettings failed to decode region settings: " + err.Error())
-	}
-
-	item := &hostnameSettingsCacheItem{
-		regionSettings:    regions,
-		updatedAt:         time.Now(),
-		regionURLAttempts: map[string]int{},
-	}
-	r.mutex.Lock()
-	r.hostnameSettingsCache[cloudHostname] = item
-	r.mutex.Unlock()
-
-	if len(item.regionSettings.Regions) == 0 {
-		logger.Warnw("no regions returned", nil, "cloudHostname", cloudHostname)
-	}
-
-	return nil
+	_, err := r.RegionSettings(cloudHostname, token)
+	return err
 }
 
-// PopBestURL removes and returns the best region URL. Once all URLs are exhausted, it will return an error.
-// RefreshRegionSettings must be called to repopulate the list of regions.
-func (r *regionURLProvider) PopBestURL(cloudHostname, token string) (string, error) {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
+// RegionSettings returns the cached region list for a hostname, refreshing it if
+// stale. The returned list is owned by the cache and must not be mutated; the
+// caller is responsible for tracking its own per-failover attempt state.
+func (r *regionURLProvider) RegionSettings(cloudHostname, token string) (*livekit.RegionSettings, error) {
+	headers := http.Header{"Authorization": []string{"Bearer " + token}}
+	settings, err := r.cache.get(cloudHostname, regionSettingsURL(cloudHostname), headers, regionHostnameProviderSettingsCacheTime)
+	if err != nil {
+		return nil, err
+	}
+	if settings == nil {
+		return nil, errors.New("no regions available")
+	}
+	if len(settings.Regions) == 0 {
+		logger.Warnw("no regions returned", nil, "cloudHostname", cloudHostname)
+	}
+	return settings, nil
+}
 
-	hostnameSettings := r.hostnameSettingsCache[cloudHostname]
+// regionCache fetches and caches the LiveKit Cloud region list per host. It is
+// shared by the API failover path (which honors the request scheme and forwards
+// the caller's headers) and the RTC signaling path (which fetches over https
+// with a bearer token). The caller supplies the discovery URL so each path
+// keeps its own URL scheme and test seams.
+type regionCache struct {
+	mu     sync.Mutex
+	client *http.Client
+	cache  map[string]*regionCacheEntry
+}
 
-	if hostnameSettings == nil || hostnameSettings.regionSettings == nil || len(hostnameSettings.regionSettings.Regions) == 0 {
-		return "", errors.New("no regions available")
+type regionCacheEntry struct {
+	settings  *livekit.RegionSettings
+	fetchedAt time.Time
+	ttl       time.Duration
+}
+
+func newRegionCache() *regionCache {
+	return &regionCache{
+		client: &http.Client{Timeout: regionDiscoveryTimeout},
+		cache:  make(map[string]*regionCacheEntry),
+	}
+}
+
+// get returns the cached region list for key, fetching discoveryURL if the
+// cache is stale. The server's Cache-Control max-age sets the TTL; when absent,
+// defaultTTL is used (0 means "do not cache"). Best-effort: on a fetch failure
+// it serves a stale cached list when available, otherwise returns the error.
+func (c *regionCache) get(key, discoveryURL string, headers http.Header, defaultTTL time.Duration) (*livekit.RegionSettings, error) {
+	key = strings.ToLower(key)
+
+	c.mu.Lock()
+	if entry := c.cache[key]; entry != nil && time.Since(entry.fetchedAt) < entry.ttl {
+		defer c.mu.Unlock()
+		return entry.settings, nil
+	}
+	c.mu.Unlock()
+
+	settings, ttl, err := c.fetch(discoveryURL, headers)
+	if err != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if entry := c.cache[key]; entry != nil {
+			return entry.settings, nil // serve stale on failure
+		}
+		return nil, err
 	}
 
-	bestRegionURL := hostnameSettings.regionSettings.Regions[0].Url
-	hostnameSettings.regionSettings.Regions = hostnameSettings.regionSettings.Regions[1:]
+	if ttl <= 0 {
+		ttl = defaultTTL
+	}
+	if ttl > 0 {
+		c.mu.Lock()
+		c.cache[key] = &regionCacheEntry{settings: settings, fetchedAt: time.Now(), ttl: ttl}
+		c.mu.Unlock()
+	}
+	return settings, nil
+}
 
-	return bestRegionURL, nil
+// set stores a region list pushed out-of-band (e.g. by the server on reconnect),
+// overriding any cached list and keeping the existing TTL, or defaultTTL.
+func (c *regionCache) set(key string, settings *livekit.RegionSettings, defaultTTL time.Duration) {
+	if settings == nil {
+		return
+	}
+	key = strings.ToLower(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ttl := defaultTTL
+	if existing := c.cache[key]; existing != nil && existing.ttl > 0 {
+		ttl = existing.ttl
+	}
+	c.cache[key] = &regionCacheEntry{settings: settings, fetchedAt: time.Now(), ttl: ttl}
+}
+
+func (c *regionCache) fetch(discoveryURL string, headers http.Header) (*livekit.RegionSettings, time.Duration, error) {
+	req, err := http.NewRequest(http.MethodGet, discoveryURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Forward the caller's headers (Authorization and any custom headers),
+	// minus body-specific ones, so a validly-signed token reaches the discovery
+	// endpoint and test directives propagate.
+	for k, vv := range headers {
+		switch http.CanonicalHeaderKey(k) {
+		case "Content-Type", "Content-Length":
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer drainResponse(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, &TwirpRegionError{StatusCode: resp.StatusCode}
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	settings := &livekit.RegionSettings{}
+	if err := protojson.Unmarshal(b, settings); err != nil {
+		return nil, 0, err
+	}
+	ttl := parseRegionSettingsMaxAge(resp.Header.Get("Cache-Control"))
+	return settings, ttl, nil
+}
+
+// parseRegionSettingsMaxAge extracts the max-age (seconds) from a Cache-Control
+// header value, returning 0 when absent or unparseable. Directive names are
+// case-insensitive per RFC 9111.
+func parseRegionSettingsMaxAge(cacheControl string) time.Duration {
+	for _, directive := range strings.Split(cacheControl, ",") {
+		directive = strings.ToLower(strings.TrimSpace(directive))
+		if strings.HasPrefix(directive, "max-age=") {
+			if secs, err := strconv.Atoi(strings.TrimPrefix(directive, "max-age=")); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	return 0
 }
 
 func parseCloudURL(serverURL string) (string, error) {
@@ -125,6 +204,8 @@ func parseCloudURL(serverURL string) (string, error) {
 	return parsedURL.Hostname(), nil
 }
 
-func isCloud(hostname string) bool {
-	return strings.HasSuffix(hostname, "livekit.cloud") || strings.HasSuffix(hostname, "livekit.io")
+// isCloud reports whether the hostname belongs to a LiveKit Cloud project
+// (a *.livekit.cloud subdomain).
+var isCloud = func(hostname string) bool {
+	return strings.HasSuffix(hostname, ".livekit.cloud")
 }

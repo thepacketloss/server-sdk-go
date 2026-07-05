@@ -28,7 +28,7 @@ import (
 	"github.com/moby/patternmatcher"
 )
 
-func createSourceTarball(
+func CreateSourceTarball(
 	directory fs.FS,
 	excludeFiles []string,
 	w io.Writer,
@@ -95,7 +95,6 @@ func createSourceTarball(
 		}
 
 		if !checkFilesToInclude(matcher, path) {
-			logger.Debugw("excluding file from tarball", "path", path)
 			return nil
 		}
 

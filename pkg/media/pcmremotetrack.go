@@ -35,6 +35,7 @@ type PCMRemoteTrackParams struct {
 	TargetSampleRate int
 	TargetChannels   int
 	Decryptor        Decryptor
+	Logger           protoLogger.Logger
 }
 
 type PCMRemoteTrackOption func(*PCMRemoteTrackParams)
@@ -60,6 +61,14 @@ func WithTargetChannels(targetChannels int) PCMRemoteTrackOption {
 func WithDecryptor(decryptor Decryptor) PCMRemoteTrackOption {
 	return func(p *PCMRemoteTrackParams) {
 		p.Decryptor = decryptor
+	}
+}
+
+// WithLogger sets the logger used by the PCMRemoteTrack. If not set, the
+// package-global logger from protoLogger.GetLogger() is used.
+func WithLogger(logger protoLogger.Logger) PCMRemoteTrackOption {
+	return func(p *PCMRemoteTrackParams) {
+		p.Logger = logger
 	}
 }
 
@@ -98,6 +107,11 @@ func NewPCMRemoteTrack(track *webrtc.TrackRemote, writer PCMRemoteTrackWriter, o
 		opt(options)
 	}
 
+	logger := options.Logger
+	if logger == nil {
+		logger = protoLogger.GetLogger()
+	}
+
 	targetChannels := options.TargetChannels
 	targetSampleRate := options.TargetSampleRate
 	if targetChannels <= 0 || targetChannels > 2 || targetSampleRate <= 0 {
@@ -122,7 +136,7 @@ func NewPCMRemoteTrack(track *webrtc.TrackRemote, writer PCMRemoteTrackWriter, o
 
 	// opus writer takes opus samples, decodes them to PCM16 samples
 	// and writes them to the pcmMWriter
-	opusWriter, err := opus.Decode(resampledPCMWriter, targetChannels, protoLogger.GetLogger())
+	opusWriter, err := opus.Decode(resampledPCMWriter, targetChannels, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +151,7 @@ func NewPCMRemoteTrack(track *webrtc.TrackRemote, writer PCMRemoteTrackWriter, o
 		resampledPCMWriter: resampledPCMWriter,
 		sampleRate:         targetSampleRate,
 		channels:           targetChannels,
-		logger:             protoLogger.GetLogger(),
+		logger:             logger,
 		isResampled:        isResampled,
 		decryptor:          options.Decryptor,
 	}

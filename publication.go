@@ -124,9 +124,10 @@ func (p *trackPublicationBase) updateInfo(info *livekit.TrackInfo) {
 	p.name.Store(info.Name)
 	p.sid.Store(info.Sid)
 	p.isMuted.Store(info.Muted)
-	if info.Type == livekit.TrackType_AUDIO {
+	switch info.Type {
+	case livekit.TrackType_AUDIO:
 		p.kind.Store(string(TrackKindAudio))
-	} else if info.Type == livekit.TrackType_VIDEO {
+	case livekit.TrackType_VIDEO:
 		p.kind.Store(string(TrackKindVideo))
 	}
 	p.info.Store(info)
@@ -489,7 +490,7 @@ func (p *LocalTrackPublication) setPublishingCodecsQuality(subscribedCodecs []*l
 			for _, subscribedQuality := range subscribedCodec.Qualities {
 				track := p.GetSimulcastTrack(subscribedQuality.Quality)
 				if track != nil {
-					track.setMuted(!subscribedQuality.Enabled)
+					track.setDisabled(!subscribedQuality.Enabled)
 					p.log.Infow(
 						"updating layer enable",
 						"trackID", p.SID(),
@@ -543,7 +544,7 @@ func (p *LocalTrackPublication) setPublishingCodecsQuality(subscribedCodecs []*l
 		for _, subscribedQuality := range subscribedCodec.Qualities {
 			track := backupCodecTracksForSimulcast[subscribedQuality.Quality]
 			if track != nil {
-				track.setMuted(!subscribedQuality.Enabled)
+				track.setDisabled(!subscribedQuality.Enabled)
 				p.log.Infow(
 					"updating layer enable",
 					"trackID", p.SID(),
@@ -598,7 +599,9 @@ func (p *LocalTrackPublication) unpublish(transport *PCTransport) error {
 		tracks = append(tracks, st)
 	}
 
-	tracks = append(tracks, p.backupCodecTrack)
+	if p.backupCodecTrack != nil {
+		tracks = append(tracks, p.backupCodecTrack)
+	}
 
 	for _, st := range p.backupCodecTracksForSimulcast {
 		tracks = append(tracks, st)
@@ -611,6 +614,7 @@ func (p *LocalTrackPublication) unpublish(transport *PCTransport) error {
 				if err := transport.pc.RemoveTrack(sender); err != nil {
 					return err
 				}
+				break
 			}
 		}
 	}
@@ -636,6 +640,9 @@ type TrackPublicationOptions struct {
 	// encryption type
 	Encryption        livekit.Encryption_Type
 	BackupCodecPolicy livekit.BackupCodecPolicy
+	// Packet trailer features signaled to the server.
+	AttachUserTimestamp bool
+	AttachFrameId       bool
 }
 
 type MuteFunc func(muted bool) error

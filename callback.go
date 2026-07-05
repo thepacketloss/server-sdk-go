@@ -138,6 +138,9 @@ const (
 )
 
 // GetDisconnectionReason converts a protocol disconnect reason to a DisconnectionReason.
+// Many protocol reasons (e.g. ROOM_DELETED, SERVER_SHUTDOWN, MEDIA_FAILURE) collapse
+// into OtherReason. New code that needs to distinguish between them should read the
+// raw protocol value via Room.DisconnectReason() instead.
 func GetDisconnectionReason(reason livekit.DisconnectReason) DisconnectionReason {
 	// TODO: SDK should forward the original reason and provide helpers like IsRequestedLeave.
 	r := OtherReason
@@ -169,6 +172,7 @@ type RoomCallback struct {
 	OnRoomMetadataChanged     func(metadata string)
 	OnRecordingStatusChanged  func(isRecording bool)
 	OnRoomMoved               func(roomName string, token string)
+	OnRoomMovedWithSID        func(roomName string, roomSID string, token string)
 	OnReconnecting            func()
 	OnReconnected             func()
 	OnLocalTrackSubscribed    func(publication *LocalTrackPublication, lp *LocalParticipant)
@@ -191,6 +195,7 @@ func NewRoomCallback() *RoomCallback {
 		OnRoomMetadataChanged:     func(metadata string) {},
 		OnRecordingStatusChanged:  func(isRecording bool) {},
 		OnRoomMoved:               func(roomName string, token string) {},
+		OnRoomMovedWithSID:        func(roomName string, roomSID string, token string) {},
 		OnReconnecting:            func() {},
 		OnReconnected:             func() {},
 		OnLocalTrackSubscribed:    func(publication *LocalTrackPublication, lp *LocalParticipant) {},
@@ -223,6 +228,12 @@ func (cb *RoomCallback) Merge(other *RoomCallback) {
 	}
 	if other.OnRecordingStatusChanged != nil {
 		cb.OnRecordingStatusChanged = other.OnRecordingStatusChanged
+	}
+	if other.OnRoomMoved != nil {
+		cb.OnRoomMoved = other.OnRoomMoved
+	}
+	if other.OnRoomMovedWithSID != nil {
+		cb.OnRoomMovedWithSID = other.OnRoomMovedWithSID
 	}
 	if other.OnReconnecting != nil {
 		cb.OnReconnecting = other.OnReconnecting

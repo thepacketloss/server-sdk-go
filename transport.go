@@ -17,6 +17,7 @@ package lksdk
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/bep/debounce"
 	"github.com/pion/dtls/v3"
+	dtlsElliptic "github.com/pion/dtls/v3/pkg/crypto/elliptic"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/interceptor/pkg/twcc"
@@ -46,6 +48,12 @@ const (
 	iceFailedTimeout           = 5 * time.Second
 	iceKeepaliveInterval       = 2 * time.Second
 )
+
+// isIPv6 reports whether ip is an IPv6 address (i.e. not IPv4). Used to keep
+// only IPv6 candidates when IPv6Only is enabled.
+func isIPv6(ip net.IP) bool {
+	return ip.To4() == nil
+}
 
 // PCTransport is a wrapper around PeerConnection, with some helper methods
 type PCTransport struct {
@@ -79,6 +87,8 @@ type PCTransportParams struct {
 	IncludeDefaultInterceptors bool
 	OnRTTUpdate                func(rtt uint32)
 	IsSender                   bool
+	DTLSEllipticCurves         []dtlsElliptic.Curve
+	IPv6Only                   bool
 }
 
 func (t *PCTransport) registerDefaultInterceptors(params PCTransportParams, i *interceptor.Registry) error {
@@ -161,6 +171,13 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 	if err := m.RegisterHeaderExtension(sdesRtpStreamIdExtension, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, err
 	}
+	absCaptureTimeExtension := webrtc.RTPHeaderExtensionCapability{URI: absCaptureTimeURI}
+	if err := m.RegisterHeaderExtension(absCaptureTimeExtension, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, err
+	}
+	if err := m.RegisterHeaderExtension(absCaptureTimeExtension, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, err
+	}
 
 	i := &interceptor.Registry{}
 
@@ -201,8 +218,17 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 
 	se := webrtc.SettingEngine{}
 	se.SetSRTPProtectionProfiles(dtls.SRTP_AEAD_AES_128_GCM, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
+	if len(params.DTLSEllipticCurves) > 0 {
+		se.SetDTLSEllipticCurves(params.DTLSEllipticCurves...)
+	}
 	se.SetDTLSRetransmissionInterval(dtlsRetransmissionInterval)
 	se.SetICETimeouts(iceDisconnectedTimeout, iceFailedTimeout, iceKeepaliveInterval)
+	if params.IPv6Only {
+		// Only gather IPv6 local candidates (so only IPv6 is sent to the server)
+		// and reject any IPv4 remote candidates advertised by the server.
+		se.SetIPFilter(isIPv6)
+		se.SetRemoteIPFilter(isIPv6)
+	}
 	lf := pionlogger.NewLoggerFactory(logger)
 	if lf != nil {
 		se.LoggerFactory = lf
@@ -217,6 +243,12 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 	t.pc = pc
 
 	pc.OnICEGatheringStateChange(t.onICEGatheringStateChange)
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		t.log.Debugw("ICE connection state changed", "state", state)
+	})
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		t.log.Debugw("peer connection state changed", "state", state)
+	})
 
 	return t, nil
 }
