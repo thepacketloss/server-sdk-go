@@ -18,6 +18,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/twitchtv/twirp"
 
 	"github.com/livekit/protocol/auth"
@@ -25,9 +26,15 @@ import (
 	"github.com/livekit/server-sdk-go/v2/signalling"
 )
 
+// requestIDHeader carries a per-request idempotency key. SDK auto-retries (see failoverTransport) will
+// keep the same key across attempts, so the server can identify and deduplicate repeated requests.
+const requestIDHeader = "X-Livekit-Request-Id"
+
 type authBase struct {
 	apiKey    string
 	apiSecret string
+	// token, when set, is sent verbatim and per-call grant signing is skipped.
+	token string
 }
 
 type authOption interface {
@@ -57,14 +64,17 @@ func (g withAgentGrant) Apply(t *auth.AccessToken) {
 // detaches a long-enough deadline so failover can reset it per attempt (see
 // withFailoverTimeout).
 func (b authBase) prepareContext(ctx context.Context, opt authOption, options ...authOption) (context.Context, error) {
-	at := auth.NewAccessToken(b.apiKey, b.apiSecret)
-	opt.Apply(at)
-	for _, opt := range options {
+	token := b.token
+	if token == "" {
+		at := auth.NewAccessToken(b.apiKey, b.apiSecret)
 		opt.Apply(at)
-	}
-	token, err := at.ToJWT()
-	if err != nil {
-		return nil, err
+		for _, opt := range options {
+			opt.Apply(at)
+		}
+		var err error
+		if token, err = at.ToJWT(); err != nil {
+			return nil, err
+		}
 	}
 
 	h := signalling.NewHTTPHeaderWithToken(token)
@@ -80,6 +90,13 @@ func (b authBase) prepareContext(ctx context.Context, opt authOption, options ..
 		for _, v := range vv {
 			ctxH.Add(k, v)
 		}
+	}
+
+	// Attach a stable idempotency key once per logical call, unless the caller
+	// already supplied one. failoverTransport replays the same headers on each
+	// retry, so every attempt carries this id and the server can dedup on it.
+	if ctxH.Get(requestIDHeader) == "" {
+		ctxH.Set(requestIDHeader, uuid.NewString())
 	}
 
 	// Detach a long-enough deadline so it isn't enforced across failover retries

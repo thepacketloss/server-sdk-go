@@ -16,6 +16,7 @@ package lksdk
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/twitchtv/twirp"
 
@@ -30,16 +31,25 @@ type EgressClient struct {
 }
 
 func NewEgressClient(url string, apiKey string, secretKey string, opts ...twirp.ClientOption) *EgressClient {
+	return newEgressClient(url, authBase{apiKey: apiKey, apiSecret: secretKey}, newAPIHTTPClient(), opts...)
+}
+
+func newEgressClient(url string, auth authBase, httpClient *http.Client, opts ...twirp.ClientOption) *EgressClient {
 	opts = append(opts, xtwirp.DefaultClientOptions()...)
 	url = signalling.ToHttpURL(url)
-	client := livekit.NewEgressProtobufClient(url, newAPIHTTPClient(), opts...)
+	client := livekit.NewEgressProtobufClient(url, httpClient, opts...)
 	return &EgressClient{
 		egressClient: client,
-		authBase: authBase{
-			apiKey:    apiKey,
-			apiSecret: secretKey,
-		},
+		authBase:     auth,
 	}
+}
+
+func (c *EgressClient) StartEgress(ctx context.Context, req *livekit.StartEgressRequest) (*livekit.EgressInfo, error) {
+	ctx, err := c.prepareContext(ctx, withVideoGrant{RoomRecord: true})
+	if err != nil {
+		return nil, err
+	}
+	return c.egressClient.StartEgress(ctx, req)
 }
 
 func (c *EgressClient) StartRoomCompositeEgress(ctx context.Context, req *livekit.RoomCompositeEgressRequest) (*livekit.EgressInfo, error) {
