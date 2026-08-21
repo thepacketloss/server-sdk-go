@@ -36,13 +36,6 @@ const (
 	// and wall-clock PTS before falling back to wall clock in wallClockPTS().
 	wallClockSanityThreshold = 5 * time.Second
 
-	// ntpTrustThreshold is the maximum allowed divergence between NTP-derived PTS
-	// and wall-clock PTS. If NTP disagrees with wall clock by more than this,
-	// the NTP data is suspect (bad SRs, clock jumps, nonsensical timing) and
-	// we clamp to wall clock. This prevents bad publishers from dragging PTS far
-	// from reality.
-	ntpTrustThreshold = 500 * time.Millisecond
-
 	// maxTimelyPacketAge is how long a track can be behind the pipeline deadline
 	// before its PTS is force-corrected forward.
 	maxTimelyPacketAge = 10 * time.Second
@@ -86,6 +79,10 @@ type syncEngineTrack struct {
 	lastNtpPTS      time.Duration // last raw NTP PTS (before corrections), for jump detection
 	hasLastNtpPTS   bool          // lastNtpPTS holds a baseline from the current NTP regression (cleared when NTP becomes unavailable or on RTP discontinuity)
 	ntpCorrection   time.Duration // smoothing correction for SR-induced NTP jumps
+
+	clampedPackets int
+	clampStartPTS  time.Duration
+	clampMaxDiff   time.Duration
 
 	// pipeline time feedback
 	lastTimelyPacket time.Time
@@ -274,6 +271,8 @@ func (st *syncEngineTrack) GetPTS(pkt jitter.ExtPacket) (time.Duration, error) {
 	}
 
 	if !ntpNowReady {
+		st.endClampEpisodeLocked(wallPTS)
+
 		// NTP is not the source for this packet — either it was never ready,
 		// the estimator was rebuilt internally (persistent outliers in the
 		// timeline's NtpEstimator), the discontinuity branch above just reset
@@ -332,15 +331,19 @@ func (st *syncEngineTrack) GetPTS(pkt jitter.ExtPacket) (time.Duration, error) {
 		// Clamp corrected PTS to within trust threshold of wall clock.
 		clamped := false
 		diff := pts - wallPTS
-		if diff > ntpTrustThreshold || diff < -ntpTrustThreshold {
-			st.logger.Warnw("NTP PTS exceeds trust threshold, clamping to wall clock", nil,
-				"rawNtpPTS", rawNtpPTS,
-				"ntpCorrection", st.ntpCorrection,
-				"wallPTS", wallPTS,
-				"diff", diff,
-			)
+		if diff > st.engine.ntpTrustThreshold || diff < -st.engine.ntpTrustThreshold {
+			if st.noteClampLocked(diff, wallPTS) {
+				st.logger.Warnw("NTP PTS exceeds trust threshold, clamping to wall clock", nil,
+					"rawNtpPTS", rawNtpPTS,
+					"ntpCorrection", st.ntpCorrection,
+					"wallPTS", wallPTS,
+					"diff", diff,
+				)
+			}
 			pts = wallPTS
 			clamped = true
+		} else {
+			st.endClampEpisodeLocked(wallPTS)
 		}
 
 		// On first successful NTP PTS that is NOT clamped, compute the
@@ -469,6 +472,42 @@ func (st *syncEngineTrack) GetPTS(pkt jitter.ExtPacket) (time.Duration, error) {
 	return pts, nil
 }
 
+func (st *syncEngineTrack) noteClampLocked(diff, wallPTS time.Duration) bool {
+	st.clampedPackets++
+	if st.clampedPackets == 1 {
+		st.clampStartPTS = wallPTS
+		st.clampMaxDiff = diff
+		return true
+	}
+
+	mag, curMax := diff, st.clampMaxDiff
+	if mag < 0 {
+		mag = -mag
+	}
+	if curMax < 0 {
+		curMax = -curMax
+	}
+	if mag > curMax {
+		st.clampMaxDiff = diff
+	}
+	return false
+}
+
+func (st *syncEngineTrack) endClampEpisodeLocked(wallPTS time.Duration) {
+	if st.clampedPackets == 0 {
+		return
+	}
+
+	st.logger.Infow("NTP clamping episode ended",
+		"clampedPackets", st.clampedPackets,
+		"episodeSpan", wallPTS-st.clampStartPTS,
+		"maxDiff", st.clampMaxDiff,
+	)
+	st.clampedPackets = 0
+	st.clampStartPTS = 0
+	st.clampMaxDiff = 0
+}
+
 func (st *syncEngineTrack) wallClockPTS(pkt jitter.ExtPacket) (slewed, unslewed time.Duration) {
 	return st.wallClockPTSForRTPLocked(pkt.Timestamp, pkt.ReceivedAt)
 }
@@ -558,6 +597,8 @@ func (st *syncEngineTrack) Close() {
 // would require holding st.mu across the user-supplied callback, which is
 // an unacceptable constraint on what the callback may do.
 func (st *syncEngineTrack) closeLocked() {
+	st.endClampEpisodeLocked(st.lastPTSAdjusted)
+
 	st.closed = true
 	// Clear the field too: OnRTCP invocations that arrive AFTER close and
 	// somehow pass the closed check would see nil. Also helps GC release
