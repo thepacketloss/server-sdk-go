@@ -17,7 +17,9 @@ package lksdk
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -280,4 +282,129 @@ func TestRegionFallbackSignalFailure(t *testing.T) {
 		return room.ConnectionState() != ConnectionStateConnected || room.engine.IsConnected() == false
 	}, 2*time.Second, 200*time.Millisecond, "connection should stay up after signal-failure fallback")
 	require.EqualValues(t, 0, disconnects.Load(), "should not disconnect after a successful fallback connect")
+}
+
+type recoveryRecorder struct {
+	engineHandler
+	mu     sync.Mutex
+	events []string
+}
+
+func (r *recoveryRecorder) record(event string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+}
+
+func (r *recoveryRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.events)
+}
+
+func (r *recoveryRecorder) OnResuming()                             { r.record("OnResuming") }
+func (r *recoveryRecorder) OnRestarting()                           { r.record("OnRestarting") }
+func (r *recoveryRecorder) OnDisconnected(livekit.DisconnectReason) { r.record("OnDisconnected") }
+
+func TestResumeFailureEscalationFiresRestarting(t *testing.T) {
+	region := newSignalFailRegion(t)
+	recorder := &recoveryRecorder{}
+	e := NewRTCEngine(false, recorder, func() string { return "PA_test" }, nil)
+	e.connectionManager = newTestConnectionManager(region.wsURL, true)
+	e.connectionManager.setConnected(&livekit.RegionInfo{Url: region.wsURL})
+	t.Cleanup(func() { e.closed.Store(true) })
+
+	e.handleDisconnect("test", false, nil)
+
+	require.Eventually(t, func() bool {
+		return len(recorder.recorded()) >= 2
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, []string{"OnResuming", "OnRestarting"}, recorder.recorded()[:2], "escalating a failed resume must announce the restart")
+}
+
+func TestRecoveryCallbacksSeparateResumeFromRestart(t *testing.T) {
+	var events []string
+	cb := NewRoomCallback()
+	cb.OnSignalReconnecting = func() { events = append(events, "SignalReconnecting") }
+	cb.OnReconnecting = func() { events = append(events, "Reconnecting") }
+	cb.OnReconnected = func() { events = append(events, "Reconnected") }
+	r := NewRoom(cb)
+
+	r.OnResuming()
+	r.OnResumed()
+	require.Equal(t, []string{"SignalReconnecting", "Reconnected"}, events)
+
+	events = nil
+	r.OnResuming()
+	r.OnRestarting()
+	r.OnRestarted(&livekit.Room{}, &livekit.ParticipantInfo{}, nil)
+	r.OnRestartConnected()
+	require.Equal(t, []string{"SignalReconnecting", "Reconnecting", "Reconnected"}, events, "a failed resume escalates to a restart")
+}
+
+func TestConnectionStateSeparatesResumeFromRestart(t *testing.T) {
+	r := NewRoom(nil)
+	r.engine.setConnected(nil)
+
+	r.engine.setResuming(nil)
+	require.Equal(t, ConnectionStateSignalReconnecting, r.ConnectionState())
+
+	r.engine.setReconnecting(nil)
+	require.Equal(t, ConnectionStateReconnecting, r.ConnectionState(), "a failed resume escalates to a restart")
+}
+
+func TestRestartFailoverReportsReconnectedOnceConnected(t *testing.T) {
+	if apiKey == "" || apiSecret == "" {
+		t.Skip("no LIVEKIT_KEYS; requires a running livekit-server")
+	}
+	stall := newStallRegion(t)
+	const connectTimeout = 2 * time.Second
+
+	var reconnected atomic.Int32
+	var stateAtReconnected atomic.String
+	var room *Room
+	room, err := createAgent("restart-failover-"+t.Name(), &RoomCallback{
+		OnReconnected: func() {
+			reconnected.Inc()
+			stateAtReconnected.Store(string(room.ConnectionState()))
+		},
+	}, "restart-failover", WithConnectTimeout(connectTimeout))
+	require.NoError(t, err)
+	defer room.Disconnect()
+
+	room.engine.handleDisconnect("test", true, &livekit.RegionSettings{
+		Regions: []*livekit.RegionInfo{{Region: "stall", Url: stall.wsURL}},
+	})
+
+	require.Eventually(t, func() bool {
+		return reconnected.Load() > 0 && room.ConnectionState() == ConnectionStateConnected
+	}, 20*time.Second, 50*time.Millisecond, "the restart should fall through the stalled region and recover")
+	require.EqualValues(t, 1, stall.dialCount.Load(), "the restart must try the stalled region first")
+	require.EqualValues(t, 1, reconnected.Load(), "one restart reports one recovery")
+	require.Equal(t, string(ConnectionStateConnected), stateAtReconnected.Load(), "OnReconnected must fire once the connection is up")
+}
+
+func TestRestartReannouncesRemoteParticipants(t *testing.T) {
+	if apiKey == "" || apiSecret == "" {
+		t.Skip("no LIVEKIT_KEYS; requires a running livekit-server")
+	}
+	var connected, disconnected atomic.Int32
+	var reconnected atomic.Bool
+	sub, err := createAgent(t.Name(), &RoomCallback{
+		OnParticipantConnected:    func(*RemoteParticipant) { connected.Inc() },
+		OnParticipantDisconnected: func(*RemoteParticipant) { disconnected.Inc() },
+		OnReconnected:             func() { reconnected.Store(true) },
+	}, "sub")
+	require.NoError(t, err)
+	defer sub.Disconnect()
+
+	pub, err := createAgent(t.Name(), nil, "pub")
+	require.NoError(t, err)
+	defer pub.Disconnect()
+	require.Eventually(t, func() bool { return connected.Load() == 1 }, 5*time.Second, 50*time.Millisecond)
+
+	sub.Simulate(SimulateNodeFailure)
+	require.Eventually(t, reconnected.Load, 15*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool { return connected.Load() == 2 }, 5*time.Second, 50*time.Millisecond, "the restart disconnected pub, so it must announce pub again")
+	require.EqualValues(t, 1, disconnected.Load())
 }

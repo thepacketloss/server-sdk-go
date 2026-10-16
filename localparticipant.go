@@ -150,23 +150,29 @@ func (p *LocalParticipant) prepareTrackPublication(track webrtc.TrackLocal, opts
 		}
 	}
 
-	// TODO: support e2ee for backup codecs
-	if pubOptions.backupCodecTrack != nil {
-		if req.Encryption == livekit.Encryption_NONE {
-			req.SimulcastCodecs = []*livekit.SimulcastCodec{
-				{
-					Codec: primaryCodec.MimeType,
-					Cid:   track.ID(),
-				},
-				{
-					Codec: pubOptions.backupCodecTrack.Codec().MimeType,
-					Cid:   pubOptions.backupCodecTrack.ID(),
-				},
-			}
-			pub.setBackupCodecTrack(pubOptions.backupCodecTrack)
-		} else {
-			p.log.Warnw("backup codec publication with encryption is not supported, ignoring backup codec", nil)
+	withBackupCodec := pubOptions.backupCodecTrack != nil
+	if withBackupCodec && req.Encryption != livekit.Encryption_NONE {
+		// TODO: support e2ee for backup codecs
+		p.log.Warnw("backup codec publication with encryption is not supported, ignoring backup codec", nil)
+		withBackupCodec = false
+	}
+
+	if primaryCodec.MimeType != "" && (kind == TrackKindVideo || withBackupCodec) {
+		req.SimulcastCodecs = []*livekit.SimulcastCodec{
+			{
+				Codec: primaryCodec.MimeType,
+				Cid:   track.ID(),
+			},
 		}
+		if withBackupCodec {
+			req.SimulcastCodecs = append(req.SimulcastCodecs, &livekit.SimulcastCodec{
+				Codec: pubOptions.backupCodecTrack.Codec().MimeType,
+				Cid:   pubOptions.backupCodecTrack.ID(),
+			})
+			pub.setBackupCodecTrack(pubOptions.backupCodecTrack)
+		}
+	} else if withBackupCodec {
+		p.log.Warnw("backup codec publication requires a known primary codec, ignoring backup codec", nil)
 	}
 	return pub, req, nil
 }
@@ -310,6 +316,7 @@ func (p *LocalParticipant) prepareSimulcastTrackPublication(tracks []*LocalTrack
 		Width:                 mainTrack.videoLayer.Width,
 		Height:                mainTrack.videoLayer.Height,
 		Layers:                layers,
+		Encryption:            opts.Encryption,
 		PacketTrailerFeatures: packetTrailerFeaturesFromOpts(opts),
 		SimulcastCodecs: []*livekit.SimulcastCodec{
 			{
@@ -320,7 +327,15 @@ func (p *LocalParticipant) prepareSimulcastTrackPublication(tracks []*LocalTrack
 			},
 		},
 	}
-	if len(pubOptions.backupCodecTracks) > 0 {
+
+	withBackupCodec := len(pubOptions.backupCodecTracks) > 0
+	if withBackupCodec && req.Encryption != livekit.Encryption_NONE {
+		// TODO: support e2ee for backup codecs
+		p.log.Warnw("backup codec publication with encryption is not supported, ignoring backup codec", nil)
+		withBackupCodec = false
+	}
+
+	if withBackupCodec {
 		for _, track := range pubOptions.backupCodecTracks {
 			// disable dynacast on a re-publication
 			track.setDisabled(false)
@@ -638,7 +653,8 @@ func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublish
 		}
 	}
 
-	// This matches the default value of Kind on protobuf level.
+	// Lossy by default to keep the old PublishData behavior.
+	// The protobuf zero value of Kind is RELIABLE, so this is not the proto default.
 	kind := livekit.DataPacket_LOSSY
 	if options.Reliable != nil && *options.Reliable {
 		kind = livekit.DataPacket_RELIABLE
@@ -651,6 +667,17 @@ func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublish
 	}
 
 	return p.engine.publishDataPacket(dataPacket, kind)
+}
+
+// PublishDTMF sends a SIP DTMF digit to the room as a livekit.SipDTMF data packet.
+// code is the RFC 4733 event code and digit is the key it represents, e.g. 11 and "#".
+//
+// DTMF always uses the RELIABLE channel so digits arrive in order.
+func (p *LocalParticipant) PublishDTMF(code uint32, digit string) error {
+	return p.PublishDataPacket(
+		&livekit.SipDTMF{Code: code, Digit: digit},
+		WithDataPublishReliable(true),
+	)
 }
 
 // UnpublishTrack stops publishing a track and removes it from the room.

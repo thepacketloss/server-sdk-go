@@ -206,22 +206,23 @@ func (c *connectionManager) setConnected(region *livekit.RegionInfo) {
 // resume starts fresh. It is a no-op unless still Resuming: if a reconnect was
 // requested while the resume was in progress, the state is left Reconnecting so
 // the pending full reconnect proceeds rather than being clobbered.
-func (c *connectionManager) setResumed(region *livekit.RegionInfo) {
+func (c *connectionManager) setResumed(region *livekit.RegionInfo) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// Closed is terminal; never transition out of it
 	if c.state == connectionManagerStateClosed {
-		return
+		return false
 	}
 
 	if c.state != connectionManagerStateResuming {
-		return
+		return false
 	}
 
 	c.regionSettings = nil
 	c.connectedRegion = utils.CloneProto(region)
 	c.updateState(connectionManagerStateConnected)
+	return true
 }
 
 func (c *connectionManager) setResuming(regionSettings *livekit.RegionSettings) {
@@ -447,8 +448,14 @@ func getConnectionPlanInitial(params connectionPlanParams) ([]connectionAttemptP
 	if !params.incomingRequestParams.disableRegionDiscovery {
 		cloudHostname, _ := parseCloudURL(params.incomingRequestParams.url)
 		if cloudHostname != "" {
+			start := time.Now()
 			settings, err := params.regionURLProvider.RegionSettings(cloudHostname, params.token)
-			if err == nil {
+			if err != nil {
+				// Discovery is best effort. Fall back to the original URL, but make
+				// the cost visible: a timeout here adds 2s to the join.
+				params.log.Warnw("region discovery failed, using original url", err,
+					"cloudHostname", cloudHostname, "duration", time.Since(start))
+			} else {
 				regionsToTry = append(regionsToTry, settings.GetRegions()...)
 			}
 		}
@@ -514,8 +521,14 @@ func getConnectionPlanReconnecting(params connectionPlanParams) ([]connectionAtt
 	if !params.incomingRequestParams.disableRegionDiscovery {
 		cloudHostname, _ := parseCloudURL(params.incomingRequestParams.url)
 		if cloudHostname != "" {
+			start := time.Now()
 			settings, err := params.regionURLProvider.RegionSettings(cloudHostname, params.token)
-			if err == nil {
+			if err != nil {
+				// Discovery is best effort. Fall back to the regions already
+				// collected, but make a slow or failed fetch visible.
+				params.log.Warnw("region discovery failed, using known regions", err,
+					"cloudHostname", cloudHostname, "duration", time.Since(start))
+			} else {
 				regionsToTry = append(regionsToTry, settings.GetRegions()...)
 			}
 		}
