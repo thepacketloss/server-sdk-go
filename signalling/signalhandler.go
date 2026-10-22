@@ -121,6 +121,18 @@ func (s *signalhandler) HandleMessage(msg proto.Message) error {
 
 	case *livekit.SignalResponse_MediaSectionsRequirement:
 		s.params.Processor.OnMediaSectionsRequirement(payload.MediaSectionsRequirement)
+
+	case *livekit.SignalResponse_RequestResponse:
+		s.params.Processor.OnRequestResponse(payload.RequestResponse)
+
+	case *livekit.SignalResponse_PublishDataTrackResponse:
+		s.params.Processor.OnPublishDataTrackResponse(payload.PublishDataTrackResponse)
+
+	case *livekit.SignalResponse_UnpublishDataTrackResponse:
+		s.params.Processor.OnUnpublishDataTrackResponse(payload.UnpublishDataTrackResponse)
+
+	case *livekit.SignalResponse_DataTrackSubscriberHandles:
+		s.params.Processor.OnDataTrackSubscriberHandles(payload.DataTrackSubscriberHandles)
 	}
 
 	return nil

@@ -34,6 +34,7 @@ import (
 	protosignalling "github.com/livekit/protocol/signalling"
 
 	"github.com/livekit/server-sdk-go/v2/e2ee"
+	"github.com/livekit/server-sdk-go/v2/internal/datatrack"
 	"github.com/livekit/server-sdk-go/v2/signalling"
 )
 
@@ -77,6 +78,11 @@ type engineHandler interface {
 	OnSubscribedQualityUpdate(subscribedQualityUpdate *livekit.SubscribedQualityUpdate)
 	OnSubscribedAudioCodecUpdate(subscribedAudioCodecUpdate *livekit.SubscribedAudioCodecUpdate)
 	OnMediaSectionsRequirement(mediaSectionsRequirement *livekit.MediaSectionsRequirement)
+	OnRequestResponse(requestResponse *livekit.RequestResponse)
+	OnPublishDataTrackResponse(publishDataTrackResponse *livekit.PublishDataTrackResponse)
+	OnUnpublishDataTrackResponse(unpublishDataTrackResponse *livekit.UnpublishDataTrackResponse)
+	OnDataTrackSubscriberHandles(dataTrackSubscriberHandles *livekit.DataTrackSubscriberHandles)
+	OnDataTrackPacket(data []byte)
 }
 
 // -------------------------------------------
@@ -89,8 +95,9 @@ var (
 // -------------------------------------------
 
 const (
-	reliableDataChannelName = "_reliable"
-	lossyDataChannelName    = "_lossy"
+	reliableDataChannelName  = "_reliable"
+	lossyDataChannelName     = "_lossy"
+	dataTrackDataChannelName = "_data_track"
 
 	maxReconnectCount        = 10
 	initialReconnectInterval = 300 * time.Millisecond
@@ -124,11 +131,20 @@ type RTCEngine struct {
 	lossyDC         *webrtc.DataChannel
 	reliableDCSub   *webrtc.DataChannel
 	lossyDCSub      *webrtc.DataChannel
+	dataTrackDC     *webrtc.DataChannel
+	dataTrackDCSub  *webrtc.DataChannel
 	reliableMsgLock sync.Mutex
 	reliableMsgSeq  uint32
 
+	dataTrackSender *dataTrackSender
+
 	trackPublishedListenersLock sync.Mutex
 	trackPublishedListeners     map[string]chan *livekit.TrackPublishedResponse
+
+	// signal requests waiting for a response, keyed by request id
+	pendingRequestsLock sync.Mutex
+	nextRequestID       uint32 // guarded by pendingRequestsLock
+	pendingRequests     map[uint32]chan proto.Message
 
 	subscriberPrimary bool
 	hasPublish        atomic.Bool
@@ -154,6 +170,7 @@ func NewRTCEngine(
 		engineHandler:            engineHandler,
 		cbGetLocalParticipantSID: getLocalParticipantSID,
 		trackPublishedListeners:  make(map[string]chan *livekit.TrackPublishedResponse),
+		pendingRequests:          make(map[uint32]chan proto.Message),
 		reliableMsgSeq:           1,
 		connectionManager:        newConnectionManager(regionProvider),
 	}
@@ -161,6 +178,7 @@ func NewRTCEngine(
 		Logger:    e.log,
 		Processor: e,
 	})
+	e.dataTrackSender = newDataTrackSender(e.log)
 	e.configureSignalling(useSinglePeerConnection)
 
 	return e
@@ -193,6 +211,7 @@ func (e *RTCEngine) configureSignalling(useSinglePeerConnection bool) {
 // SetLogger overrides default logger.
 func (e *RTCEngine) SetLogger(l protoLogger.Logger) {
 	e.log = l
+	e.dataTrackSender.setLogger(l)
 	e.connectionManager.setLogger(l)
 	e.signalling.SetLogger(l)
 	e.signalHandler.SetLogger(l)
@@ -359,6 +378,8 @@ func (e *RTCEngine) Close() {
 	}
 
 	e.connectionManager.setClosed()
+	e.abortPendingRequests()
+	e.dataTrackSender.stop()
 
 	e.pclock.Lock()
 	e.pendingPublisherOffer = webrtc.SessionDescription{}
@@ -547,6 +568,20 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 		return err
 	}
 	e.reliableDC.OnMessage(e.handleDataPacket)
+
+	e.dataTrackDC, err = e.publisher.pc.CreateDataChannel(dataTrackDataChannelName, &webrtc.DataChannelInit{
+		Ordered:        &falseVal,
+		MaxRetransmits: new(uint16),
+	})
+	if err != nil {
+		e.dclock.Unlock()
+		return err
+	}
+	e.dataTrackDC.OnMessage(e.handleDataTrackPacket)
+	e.dataTrackDC.SetBufferedAmountLowThreshold(dataTrackBufferedAmountLowThreshold)
+	e.dataTrackDC.OnBufferedAmountLow(e.dataTrackSender.wake)
+	e.dataTrackDC.OnOpen(e.dataTrackSender.wake)
+	e.dataTrackSender.setDataChannel(e.dataTrackDC)
 	e.dclock.Unlock()
 
 	return nil
@@ -633,6 +668,10 @@ func (e *RTCEngine) createSubscriberPCLocked(configuration webrtc.Configuration)
 			e.reliableDCSub = c
 		} else if c.Label() == lossyDataChannelName {
 			e.lossyDCSub = c
+		} else if c.Label() == dataTrackDataChannelName {
+			e.dataTrackDCSub = c
+			c.OnMessage(e.handleDataTrackPacket)
+			return
 		} else {
 			return
 		}
@@ -708,22 +747,24 @@ func (e *RTCEngine) GetDataChannelSub(kind livekit.DataPacket_Kind) *webrtc.Data
 }
 
 func (e *RTCEngine) waitUntilConnected(timeout time.Duration) error {
-	return waitUntilConnected(timeout, func() bool {
+	return waitUntilConnected(context.Background(), timeout, func() bool {
 		return e.IsConnected()
 	})
 }
 
-func (e *RTCEngine) ensurePublisherConnected(ensureDataReady bool) error {
+// ensurePublisherConnected waits for the publisher connection, giving up when ctx ends or the
+// connect timeout passes, whichever comes first.
+func (e *RTCEngine) ensurePublisherConnected(ctx context.Context, ensureDataReady bool) error {
 	e.pclock.Lock()
 	subscriberPrimary := e.subscriberPrimary
 	e.pclock.Unlock()
 	connectTimeout := e.connectionManager.getConnectTimeout()
 	if !subscriberPrimary {
-		return e.waitUntilConnected(connectTimeout)
+		return waitUntilConnected(ctx, connectTimeout, e.IsConnected)
 	}
 
 	var negotiated bool
-	return waitUntilConnected(connectTimeout, func() bool {
+	return waitUntilConnected(ctx, connectTimeout, func() bool {
 		if publisher, ok := e.Publisher(); ok {
 			if publisher.IsConnected() && (!ensureDataReady || e.dataPubChannelReady()) {
 				return true
@@ -740,7 +781,9 @@ func (e *RTCEngine) ensurePublisherConnected(ensureDataReady bool) error {
 func (e *RTCEngine) dataPubChannelReady() bool {
 	e.dclock.RLock()
 	defer e.dclock.RUnlock()
-	return e.reliableDC.ReadyState() == webrtc.DataChannelStateOpen && e.lossyDC.ReadyState() == webrtc.DataChannelStateOpen
+	return e.reliableDC.ReadyState() == webrtc.DataChannelStateOpen &&
+		e.lossyDC.ReadyState() == webrtc.DataChannelStateOpen &&
+		e.dataTrackDC.ReadyState() == webrtc.DataChannelStateOpen
 }
 
 func (e *RTCEngine) RegisterTrackPublishedListener(cid string, c chan *livekit.TrackPublishedResponse) {
@@ -753,6 +796,76 @@ func (e *RTCEngine) UnregisterTrackPublishedListener(cid string) {
 	e.trackPublishedListenersLock.Lock()
 	delete(e.trackPublishedListeners, cid)
 	e.trackPublishedListenersLock.Unlock()
+}
+
+func (e *RTCEngine) newPendingRequest() *pendingRequest {
+	p := &pendingRequest{
+		engine: e,
+		ch:     make(chan proto.Message, 1),
+	}
+
+	e.pendingRequestsLock.Lock()
+	p.id = e.allocateRequestIDLocked()
+	if e.closed.Load() {
+		// nothing will answer, fail Await right away
+		close(p.ch)
+	} else {
+		e.pendingRequests[p.id] = p.ch
+	}
+	e.pendingRequestsLock.Unlock()
+
+	return p
+}
+
+// allocateRequestIDLocked returns the next request id not in use by a pending request, skipping
+// zero. Wrapping around is harmless: an id is reused only once its previous request is done.
+func (e *RTCEngine) allocateRequestIDLocked() uint32 {
+	for {
+		e.nextRequestID++
+		if e.nextRequestID == 0 {
+			continue
+		}
+		if _, inUse := e.pendingRequests[e.nextRequestID]; !inUse {
+			return e.nextRequestID
+		}
+	}
+}
+
+func (e *RTCEngine) removePendingRequest(requestID uint32) {
+	e.pendingRequestsLock.Lock()
+	delete(e.pendingRequests, requestID)
+	e.pendingRequestsLock.Unlock()
+}
+
+// deliverResponse hands res to the request waiting for requestID, if any.
+func (e *RTCEngine) deliverResponse(requestID uint32, res proto.Message) bool {
+	if requestID == 0 {
+		return false
+	}
+
+	e.pendingRequestsLock.Lock()
+	ch, ok := e.pendingRequests[requestID]
+	delete(e.pendingRequests, requestID)
+	e.pendingRequestsLock.Unlock()
+	if !ok {
+		return false
+	}
+
+	// buffered, and removed from the map above so this is the only send
+	ch <- res
+	return true
+}
+
+// abortPendingRequests fails every request still waiting for a response.
+func (e *RTCEngine) abortPendingRequests() {
+	e.pendingRequestsLock.Lock()
+	pending := e.pendingRequests
+	e.pendingRequests = make(map[uint32]chan proto.Message)
+	e.pendingRequestsLock.Unlock()
+
+	for _, ch := range pending {
+		close(ch)
+	}
 }
 
 func (e *RTCEngine) handleDataPacket(msg webrtc.DataChannelMessage) {
@@ -829,6 +942,13 @@ func (e *RTCEngine) handleDataPacket(msg webrtc.DataChannelMessage) {
 	}
 }
 
+func (e *RTCEngine) handleDataTrackPacket(msg webrtc.DataChannelMessage) {
+	if msg.IsString {
+		return
+	}
+	e.engineHandler.OnDataTrackPacket(msg.Data)
+}
+
 func (e *RTCEngine) readDataPacket(msg webrtc.DataChannelMessage) (*livekit.DataPacket, error) {
 	dataPacket := &livekit.DataPacket{}
 	if msg.IsString {
@@ -869,6 +989,7 @@ func (e *RTCEngine) handleDisconnect(reason string, fullReconnect bool, regionSe
 		reconnectCount := 0
 		for reconnectCount < maxReconnectCount && !e.closed.Load() {
 			if e.connectionManager.isReconnectingState() {
+				e.cleanupConnection()
 				if reconnectCount == 0 {
 					e.engineHandler.OnRestarting()
 				}
@@ -1042,7 +1163,8 @@ func (e *RTCEngine) cleanupConnection() {
 }
 
 func (e *RTCEngine) restartConnection() error {
-	e.cleanupConnection()
+	// the new session will never answer requests made on the old one
+	e.abortPendingRequests()
 	if err := e.join(nil, nil); err != nil {
 		return err
 	}
@@ -1112,7 +1234,7 @@ func filterTURNServers(iceServers []*livekit.ICEServer) []*livekit.ICEServer {
 }
 
 func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.DataPacket_Kind) error {
-	err := e.ensurePublisherConnected(true)
+	err := e.ensurePublisherConnected(context.Background(), true)
 	if err != nil {
 		e.log.Errorw("could not ensure publisher connected", err)
 		return err
@@ -1321,6 +1443,18 @@ func (e *RTCEngine) SendUpdateSubscription(updateSubscription *livekit.UpdateSub
 
 func (e *RTCEngine) SendSyncState(syncState *livekit.SyncState) error {
 	return e.signalTransport.SendMessage(e.signalling.SignalSyncState(syncState))
+}
+
+func (e *RTCEngine) SendPublishDataTrack(publishDataTrack *livekit.PublishDataTrackRequest) error {
+	return e.signalTransport.SendMessage(e.signalling.SignalPublishDataTrack(publishDataTrack))
+}
+
+func (e *RTCEngine) SendUnpublishDataTrack(unpublishDataTrack *livekit.UnpublishDataTrackRequest) error {
+	return e.signalTransport.SendMessage(e.signalling.SignalUnpublishDataTrack(unpublishDataTrack))
+}
+
+func (e *RTCEngine) SendUpdateDataSubscription(updateDataSubscription *livekit.UpdateDataSubscription) error {
+	return e.signalTransport.SendMessage(e.signalling.SignalUpdateDataSubscription(updateDataSubscription))
 }
 
 func (e *RTCEngine) SendLeaveWithReason(reason livekit.DisconnectReason) error {
@@ -1677,6 +1811,26 @@ func (e *RTCEngine) OnMediaSectionsRequirement(mediaSectionsRequirement *livekit
 	e.engineHandler.OnMediaSectionsRequirement(mediaSectionsRequirement)
 }
 
+func (e *RTCEngine) OnRequestResponse(res *livekit.RequestResponse) {
+	if e.deliverResponse(res.GetRequestId(), res) {
+		return
+	}
+
+	e.engineHandler.OnRequestResponse(res)
+}
+
+func (e *RTCEngine) OnPublishDataTrackResponse(publishDataTrackResponse *livekit.PublishDataTrackResponse) {
+	e.engineHandler.OnPublishDataTrackResponse(publishDataTrackResponse)
+}
+
+func (e *RTCEngine) OnUnpublishDataTrackResponse(unpublishDataTrackResponse *livekit.UnpublishDataTrackResponse) {
+	e.engineHandler.OnUnpublishDataTrackResponse(unpublishDataTrackResponse)
+}
+
+func (e *RTCEngine) OnDataTrackSubscriberHandles(dataTrackSubscriberHandles *livekit.DataTrackSubscriberHandles) {
+	e.engineHandler.OnDataTrackSubscriberHandles(dataTrackSubscriberHandles)
+}
+
 // ------------------------------------
 
 func setConfiguration(pcTransport *PCTransport, configuration webrtc.Configuration) {
@@ -1685,7 +1839,7 @@ func setConfiguration(pcTransport *PCTransport, configuration webrtc.Configurati
 	}
 }
 
-func waitUntilConnected(d time.Duration, test func() bool) error {
+func waitUntilConnected(ctx context.Context, d time.Duration, test func() bool) error {
 	if test() {
 		return nil
 	}
@@ -1698,6 +1852,9 @@ func waitUntilConnected(d time.Duration, test func() bool) error {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
 		case <-timeout.C:
 			return ErrConnectionTimeout
 
@@ -1707,4 +1864,8 @@ func waitUntilConnected(d time.Duration, test func() bool) error {
 			}
 		}
 	}
+}
+
+func (e *RTCEngine) sendDataTrackFrame(frame datatrack.FramePackets) {
+	e.dataTrackSender.send(frame)
 }

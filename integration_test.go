@@ -833,7 +833,7 @@ func TestForceTLS(t *testing.T) {
 	pub.LocalParticipant.PublishDataPacket(UserData([]byte("test")), WithDataPublishReliable(true))
 
 	pub.Simulate(SimulateForceTLS)
-	require.Eventually(t, func() bool { return reconnected.Load() && pub.engine.ensurePublisherConnected(true) == nil }, 15*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return reconnected.Load() && pub.engine.ensurePublisherConnected(context.Background(), true) == nil }, 15*time.Second, 100*time.Millisecond)
 
 	pub.log.Infow("reconnected")
 
@@ -974,6 +974,36 @@ func TestLimitPayloadSize(t *testing.T) {
 	require.ErrorIs(t, localTrack.WriteRTP(&rtpPkt), interceptor.ErrPayloadSizeTooLarge)
 
 	pub.Disconnect()
+}
+
+// OnProgress reports the fraction of the stream written so far, so the
+// count carries over between Write calls and ends at 1.
+func TestStreamTextProgressAcrossWrites(t *testing.T) {
+	pub, err := createAgent(t.Name(), nil, "publisher")
+	require.NoError(t, err)
+	defer pub.Disconnect()
+
+	part := strings.Repeat("a", STREAM_CHUNK_SIZE+100)
+	var progress []float64
+	writer := pub.LocalParticipant.StreamText(StreamTextOptions{
+		TotalSize:  uint64(2 * len(part)),
+		OnProgress: func(p float64) { progress = append(progress, p) },
+	})
+	defer writer.Close()
+
+	done := make(chan struct{})
+	onDone := func() { close(done) }
+	writer.Write(part, nil)
+	writer.Write(part, &onDone)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("write did not finish")
+	}
+
+	require.Len(t, progress, 4)
+	require.IsIncreasing(t, progress)
+	require.Equal(t, 1.0, progress[3])
 }
 
 // A plain video publish must come back with a mime type on its TrackInfo. The
